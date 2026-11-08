@@ -1,0 +1,182 @@
+{
+  "format": "proposal-nav",
+  "version": 1,
+  "id": "order-eligibility",
+  "revision": 1,
+  "title": "Check order eligibility before payment",
+  "request": "Reject orders from inactive customers or with no items before charging them, and return a useful reason.",
+  "overview": {
+    "summary": "Keep eligibility rules in the order domain, enforce them in the shared submission service, and translate rejection into an HTTP response at the route boundary.",
+    "architecture": "HTTP routes adapt requests and responses. The shared order service coordinates customer lookup, payment, and persistence. The validation module owns order business rules. The returns service provides an existing example of eligibility checks before side effects.",
+    "questions": [
+      "Should rejection reasons be stable machine-readable codes as well as human-readable messages?"
+    ]
+  },
+  "base_commit": null,
+  "annotations": [
+    {
+      "id": "eligibility-rules",
+      "title": "Define eligibility rules",
+      "operation": "insert_after",
+      "target": {
+        "path": "src/orders/validation.ts",
+        "line": 14,
+        "context": "}"
+      },
+      "intent": "Add validateOrder(order, customer). Return an allowed result or a reason for rejection. Check that the customer is active and the order has at least one item.",
+      "rationale": "This module already owns order-specific rules. A pure function keeps business decisions separate from database access, payment, and HTTP concerns.",
+      "alternatives": [
+        "Putting the checks directly in submitOrder would work initially, but would mix rule definitions with orchestration."
+      ],
+      "related": [
+        {
+          "type": "code",
+          "label": "Existing validation pattern",
+          "target": {
+            "path": "src/returns/service.ts",
+            "line": 12,
+            "context": "function validateReturn(request, customer) {"
+          }
+        },
+        {
+          "type": "annotation",
+          "label": "Where the rules will be enforced",
+          "annotation_id": "validate-before-payment"
+        }
+      ]
+    },
+    {
+      "id": "validate-before-payment",
+      "title": "Validate before payment",
+      "operation": "insert_before",
+      "target": {
+        "path": "src/orders/service.ts",
+        "line": 8,
+        "context": "  const payment = await payments.charge(order);"
+      },
+      "intent": "Call validateOrder(order, customer) after loading the customer and before payments.charge. Import the validator from the order validation module.",
+      "rationale": "submitOrder coordinates customer lookup, payment, and persistence. Both HTTP requests and background jobs use this boundary, so every submission path receives the check.",
+      "alternatives": [
+        "Checking only in the HTTP route would let other callers bypass eligibility. Checking inside payments.charge would give a payment component responsibility for order rules."
+      ],
+      "related": [
+        {
+          "type": "code",
+          "label": "HTTP caller",
+          "target": {
+            "path": "src/routes/orders.ts",
+            "line": 6,
+            "context": "  const result = await submitOrder(order);"
+          }
+        },
+        {
+          "type": "code",
+          "label": "Comparable service flow",
+          "target": {
+            "path": "src/returns/service.ts",
+            "line": 5,
+            "context": "  const eligibility = validateReturn(request, customer);"
+          }
+        },
+        {
+          "type": "annotation",
+          "label": "Proposed rule definition",
+          "annotation_id": "eligibility-rules"
+        }
+      ]
+    },
+    {
+      "id": "stop-rejection",
+      "title": "Stop rejected submissions",
+      "operation": "insert_before",
+      "target": {
+        "path": "src/orders/service.ts",
+        "line": 8,
+        "context": "  const payment = await payments.charge(order);"
+      },
+      "intent": "When validation fails, return { accepted: false, reason } immediately. Do not charge the customer or persist an order.",
+      "rationale": "The service owns the submission outcome. An early return protects both side effects and follows the rejection pattern used by the returns service.",
+      "alternatives": [
+        "Throwing an exception would require every caller to distinguish expected business rejection from infrastructure failures."
+      ],
+      "related": [
+        {
+          "type": "code",
+          "label": "Existing early-return pattern",
+          "target": {
+            "path": "src/returns/service.ts",
+            "line": 6,
+            "context": "  if (!eligibility.allowed) {"
+          }
+        },
+        {
+          "type": "annotation",
+          "label": "HTTP error mapping",
+          "annotation_id": "http-rejection"
+        }
+      ]
+    },
+    {
+      "id": "http-rejection",
+      "title": "Return a useful HTTP error",
+      "operation": "replace",
+      "target": {
+        "path": "src/routes/orders.ts",
+        "line": 7,
+        "context": "  return response.status(201).json(result.order);"
+      },
+      "intent": "Inspect result.accepted. Return HTTP 422 with the rejection reason when false; preserve the existing 201 response on success.",
+      "rationale": "The route owns HTTP status codes and response shapes. The domain service should expose a transport-independent result.",
+      "alternatives": [
+        "Returning HTTP status codes from submitOrder would couple background-job callers to an HTTP concept."
+      ],
+      "related": [
+        {
+          "type": "code",
+          "label": "Service result",
+          "target": {
+            "path": "src/orders/service.ts",
+            "line": 10,
+            "context": "  return { accepted: true, order: saved };"
+          }
+        },
+        {
+          "type": "annotation",
+          "label": "Proposed rejection result",
+          "annotation_id": "stop-rejection"
+        }
+      ]
+    },
+    {
+      "id": "rejection-tests",
+      "title": "Cover rejection behavior",
+      "operation": "insert_before",
+      "target": {
+        "path": "tests/orders.test.ts",
+        "line": 10,
+        "context": "});"
+      },
+      "intent": "Add inactive-customer and empty-order cases. Assert a useful rejection reason and that payments.charge and orders.save are never called. Keep the existing success case.",
+      "rationale": "The critical guarantee crosses validation and orchestration: rejected orders must never trigger side effects. Service-level tests exercise that boundary.",
+      "alternatives": [
+        "Validator-only tests would check the rules but miss an accidental payment before validation. Route tests should separately verify the 422 mapping."
+      ],
+      "related": [
+        {
+          "type": "code",
+          "label": "Protected side effects",
+          "target": {
+            "path": "src/orders/service.ts",
+            "line": 8,
+            "context": "  const payment = await payments.charge(order);"
+          }
+        },
+        {
+          "type": "annotation",
+          "label": "HTTP boundary",
+          "annotation_id": "http-rejection"
+        }
+      ]
+    }
+  ]
+}

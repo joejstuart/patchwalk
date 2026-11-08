@@ -1,0 +1,20 @@
+[package]
+name = "proposal-nav"
+version = "0.1.0"
+edition = "2024"
+description = "Explore a saved change proposal as annotations in existing code"
+license = "MIT"
+
+[dependencies]
+ratatui = "0.30"
+crossterm = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+textwrap = "0.16"
+jsonschema = { version = "0.60", default-features = false }
+sha2 = "0.10"
+syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
+
+[profile.release]
+lto = "thin"
+strip = true

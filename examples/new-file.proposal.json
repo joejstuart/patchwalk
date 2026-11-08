@@ -1,0 +1,26 @@
+{
+  "format": "proposal-nav",
+  "version": 1,
+  "id": "new-eligibility-module",
+  "revision": 1,
+  "title": "Introduce an eligibility module",
+  "request": "Create a pure function for order eligibility rules.",
+  "overview": {
+    "summary": "Define the rules in a new module without introducing side effects.",
+    "architecture": "The proposed module owns rule evaluation. Existing submission services would call it in a subsequent change.",
+    "questions": ["What order and customer types should the function accept?"]
+  },
+  "base_commit": null,
+  "annotations": [
+    {
+      "id": "create-eligibility-module",
+      "title": "Create the eligibility module",
+      "operation": "create_file",
+      "target": { "path": "src/orders/eligibility.ts" },
+      "intent": "Export a pure validateOrder function that returns eligibility and a reason.",
+      "rationale": "Keep reusable business rules separate from transport and persistence.",
+      "alternatives": ["Place rules directly in the service if they will never be reused."],
+      "related": []
+    }
+  ]
+}

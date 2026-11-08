@@ -1,0 +1,6 @@
+__pycache__/
+.review-state.json
+.review-state.json.tmp
+target/
+*.review.json
+*.review.json.tmp

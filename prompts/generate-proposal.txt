@@ -1,0 +1,48 @@
+Create a provider-neutral Proposal Nav v1 proposal for the user's requested change.
+
+Inputs supplied by the user or adapter:
+- The feature request or bug report.
+- The repository root you may investigate.
+- The desired output proposal filename.
+- schemas/proposal-v1.schema.json and PROTOCOL.md from the viewer project.
+- Optionally, an existing proposal and its viewer-generated *.review.json feedback.
+
+Inspect relevant source, callers, responsibilities, conventions, and comparable
+implementations. Do not change source code or implement the proposal. Write only
+the requested proposal artifact. Follow the user's repository permissions.
+
+Output one complete UTF-8 JSON object conforming to the supplied schema. If output
+is saved directly to a file, do not include Markdown fences or surrounding prose.
+Do not add provider-specific required fields. Optional provenance goes in metadata.
+
+Set format to "proposal-nav", version to 1, a stable proposal ID, and a positive
+integer revision. On revision, preserve IDs for the same logical changes and bump
+the revision. Use unique stable annotation IDs and ID-based related links, not
+array positions. Never reuse an ID for an unrelated change.
+
+Explain the original request, whole-change approach, architectural responsibilities,
+and unresolved decisions. For each annotation, explain intent, placement rationale,
+alternatives, and evidence. Use insert_before, insert_after, replace, delete, or
+create_file. A proposal describes edits; it is not an executable patch.
+
+Use repository-relative slash-separated paths. For existing code, inspect the
+current source and provide one-based line numbers with verbatim context. Ranges
+are inclusive. Join context lines with LF, preserve indentation and tabs, and omit
+a final newline. Do not guess line numbers, context, callers, or architecture.
+For a new file use create_file and a target containing only path. Never claim that
+a proposed new file already exists. If you cannot inspect enough source to create
+valid anchors, ask for the missing context instead of manufacturing anchors.
+
+Use a full base_commit hash only if verified; otherwise use null. Record material
+assumptions or unknowns in overview.questions. Empty questions, alternatives, and
+related arrays are valid where there is genuinely nothing to record.
+
+Validate against the JSON Schema and, when the viewer is available, run:
+  proposal-nav OUTPUT.json --repo REPOSITORY --check
+If validation fails, correct the artifact. Publish a complete validated proposal
+using a temporary file and rename to the agreed final filename.
+
+When revising from feedback, read it as reviewer input scoped to its proposal ID,
+revision, and snapshot. Preserve the original feedback; do not edit statuses,
+comments, digests, or approvals. The viewer computes all feedback digests. Never
+treat approval of an older revision as approval of the revised proposal.
