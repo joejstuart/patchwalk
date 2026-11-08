@@ -11,6 +11,7 @@ pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 // UI model: wire IDs are resolved into navigation indices only after validation.
 pub struct Proposal {
+    pub version: u8,
     pub id: String,
     pub revision: u64,
     pub title: String,
@@ -59,9 +60,82 @@ pub struct Project {
     pub proposal: Proposal,
     pub files: HashMap<String, Vec<String>>,
     pub new_files: HashSet<String>,
+    pub diffs: HashMap<String, FileDiff>,
     pub state_path: PathBuf,
     signature: String,
     source_signature: String,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum DiffKind {
+    Context,
+    Added,
+    Removed,
+}
+pub struct DiffLine {
+    pub before: Option<usize>,
+    pub after: Option<usize>,
+    pub text: String,
+    pub kind: DiffKind,
+    pub missing_newline: bool,
+    pub emphasized: Vec<std::ops::Range<usize>>,
+}
+pub struct FileDiff {
+    pub before: Option<String>,
+    pub after: Option<String>,
+    pub lines: Vec<DiffLine>,
+}
+impl FileDiff {
+    pub(crate) fn new(file: protocol::ImplementedFile) -> Self {
+        let diff = similar::TextDiff::from_lines(
+            file.before.as_deref().unwrap_or(""),
+            file.after.as_deref().unwrap_or(""),
+        );
+        let mut options = similar::InlineChangeOptions::new();
+        options
+            .mode(similar::InlineChangeMode::Chars)
+            .min_ratio(0.0);
+        // Bound optional intraline refinement; line-level diffs remain available.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+        let lines = diff
+            .iter_all_inline_changes_with_options_deadline(options, Some(deadline))
+            .map(|change| {
+                let raw: String = change.values().iter().map(|(_, value)| *value).collect();
+                let text = raw.trim_end_matches('\n').trim_end_matches('\r');
+                let mut emphasized = Vec::new();
+                let (mut bytes, mut characters) = (0usize, 0usize);
+                for (highlight, part) in change.values() {
+                    let available = text.len().saturating_sub(bytes).min(part.len());
+                    let count: usize = part[..available]
+                        .chars()
+                        .map(|c| if c == '\t' { 4 } else { 1 })
+                        .sum();
+                    if *highlight && count > 0 {
+                        emphasized.push(characters..characters + count);
+                    }
+                    characters += count;
+                    bytes += part.len();
+                }
+                DiffLine {
+                    missing_newline: change.missing_newline(),
+                    before: change.old_index().map(|n| n + 1),
+                    after: change.new_index().map(|n| n + 1),
+                    text: text.replace('\t', "    "),
+                    kind: match change.tag() {
+                        similar::ChangeTag::Equal => DiffKind::Context,
+                        similar::ChangeTag::Insert => DiffKind::Added,
+                        similar::ChangeTag::Delete => DiffKind::Removed,
+                    },
+                    emphasized,
+                }
+            })
+            .collect();
+        Self {
+            before: file.before,
+            after: file.after,
+            lines,
+        }
+    }
 }
 
 fn source_path(root: &Path, file: &str) -> Result<PathBuf> {
@@ -114,6 +188,96 @@ impl Project {
                 return Err(format!("Duplicate annotation ID: {}", note.id).into());
             }
         }
+        let git_base = if document
+            .implementation
+            .as_ref()
+            .and_then(|i| i.source.as_deref())
+            == Some("git")
+        {
+            Some(crate::git_baseline::GitBaseline::new(
+                &root,
+                document
+                    .base_commit
+                    .as_deref()
+                    .ok_or("Git mode requires base_commit")?,
+            )?)
+        } else {
+            None
+        };
+        let implementation_files = if let Some(base) = &git_base {
+            let paths: std::collections::BTreeSet<_> = document
+                .annotations
+                .iter()
+                .map(|note| note.target.path.clone())
+                .collect();
+            let mut result = Vec::new();
+            for name in paths {
+                let source = source_path(&root, &name)?;
+                let after = match fs::read_to_string(&source) {
+                    Ok(text) => Some(text),
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::NotFound
+                            && fs::symlink_metadata(&source).is_err() =>
+                    {
+                        None
+                    }
+                    Err(e) => return Err(e.into()),
+                };
+                result.push(protocol::ImplementedFile {
+                    before: base.read(&name)?,
+                    after,
+                    path: name,
+                });
+            }
+            Some(result)
+        } else {
+            document.implementation.and_then(|i| i.files)
+        };
+        let mut diffs = HashMap::new();
+        if let Some(implementation_files) = implementation_files {
+            for file in implementation_files {
+                let source = source_path(&root, &file.path)?;
+                if file.before == file.after {
+                    return Err(format!("Unchanged implementation file: {}", file.path).into());
+                }
+                let current = match fs::read_to_string(&source) {
+                    Ok(text) => Some(text),
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::NotFound
+                            && fs::symlink_metadata(&source).is_err() =>
+                    {
+                        None
+                    }
+                    Err(e) => return Err(e.into()),
+                };
+                if current != file.after {
+                    return Err(format!(
+                        "Implemented source drift: {} does not match the after snapshot",
+                        file.path
+                    )
+                    .into());
+                }
+                if !document
+                    .annotations
+                    .iter()
+                    .any(|note| note.target.path == file.path)
+                {
+                    return Err(format!("Implemented file has no annotation: {}", file.path).into());
+                }
+                let name = file.path.clone();
+                if diffs.insert(name.clone(), FileDiff::new(file)).is_some() {
+                    return Err(format!("Duplicate implementation file: {name}").into());
+                }
+            }
+            for note in &document.annotations {
+                let diff = diffs
+                    .get(&note.target.path)
+                    .ok_or("Every implemented annotation must refer to a captured changed file")?;
+                if (note.operation == "create_file") != diff.before.is_none() {
+                    return Err("create_file must refer to an absent before snapshot".into());
+                }
+            }
+        }
         let mut files = HashMap::<String, Vec<String>>::new();
         let mut new_files = HashSet::new();
         // Validate against raw source before converting tabs for display.
@@ -123,7 +287,7 @@ impl Project {
                 return Err("A proposal cannot use itself as source".into());
             }
             if create {
-                if fs::symlink_metadata(&source).is_ok() {
+                if !diffs.contains_key(&target.path) && fs::symlink_metadata(&source).is_ok() {
                     return Err(format!("New file already exists: {}", target.path).into());
                 }
                 if !new_files.insert(target.path.clone()) {
@@ -142,10 +306,21 @@ impl Project {
             if !files.contains_key(&target.path) {
                 files.insert(
                     target.path.clone(),
-                    fs::read_to_string(source)?
-                        .lines()
-                        .map(str::to_owned)
-                        .collect(),
+                    match diffs.get(&target.path) {
+                        Some(diff) => diff
+                            .before
+                            .clone()
+                            .ok_or("Evidence requires existing before source")?,
+                        None => match &git_base {
+                            Some(base) => base
+                                .read(&target.path)?
+                                .ok_or("Evidence file does not exist in base commit")?,
+                            None => fs::read_to_string(source)?,
+                        },
+                    }
+                    .lines()
+                    .map(str::to_owned)
+                    .collect(),
                 );
             }
             let lines = &files[&target.path];
@@ -241,12 +416,22 @@ impl Project {
                 }
             })
             .collect();
-        let source_signature = protocol::digest(&serde_json::json!({
+        let mut source_state = serde_json::json!({
             "files": files.iter().collect::<std::collections::BTreeMap<_, _>>(),
             "new_files": new_files.iter().collect::<std::collections::BTreeSet<_>>()
-        }));
+        });
+        if !diffs.is_empty() {
+            source_state["implemented_after"] = serde_json::to_value(
+                diffs
+                    .iter()
+                    .map(|(path, diff)| (path, &diff.after))
+                    .collect::<std::collections::BTreeMap<_, _>>(),
+            )?;
+        }
+        let source_signature = protocol::digest(&source_state);
         Ok(Self {
             proposal: Proposal {
+                version: document.version,
                 id: document.id,
                 revision: document.revision,
                 title: document.title,
@@ -267,6 +452,7 @@ impl Project {
                 })
                 .collect(),
             new_files,
+            diffs,
             state_path: path.with_extension("review.json"),
             signature,
             source_signature,
@@ -402,6 +588,27 @@ mod tests {
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
+    #[test]
+    fn intraline_changes_track_characters_after_unicode_and_expanded_tabs() {
+        let diff = FileDiff::new(protocol::ImplementedFile {
+            path: "code.ts".into(),
+            before: Some("\tlet 名 = 30;\n".into()),
+            after: Some("\tlet 名 = 60;\n".into()),
+        });
+        assert_eq!(diff.lines.len(), 2);
+        for (line, expected) in diff.lines.iter().zip(["3", "6"]) {
+            assert!(line.text.starts_with("    let 名"));
+            let emphasized: String = line
+                .text
+                .chars()
+                .enumerate()
+                .filter(|(index, _)| line.emphasized.iter().any(|range| range.contains(index)))
+                .map(|(_, character)| character)
+                .collect();
+            assert_eq!(emphasized, expected);
+        }
+    }
+
     struct Fixture(PathBuf);
 
     impl Fixture {
@@ -527,7 +734,7 @@ mod tests {
         let valid = read_json(&fixture);
         let mut cases = Vec::new();
         let mut value = valid.clone();
-        value["version"] = 2.into();
+        value["version"] = 99.into();
         cases.push(value);
         let mut value = valid.clone();
         value["unexpected"] = true.into();
@@ -652,5 +859,176 @@ mod tests {
                 .comments
                 .is_empty()
         );
+    }
+    #[test]
+    fn implemented_proposal_anchors_before_source_and_checks_after_drift() {
+        let fixture = Fixture::new();
+        let mut value = read_json(&fixture);
+        let before = "function submit() {}\n";
+        let after = "function submit() { validate(); }\n";
+        value["version"] = 2.into();
+        value["implementation"] =
+            serde_json::json!({"files":[{"path":"code.ts","before":before,"after":after}]});
+        fs::write(fixture.0.join("code.ts"), after).unwrap();
+        write_json(&fixture, &value);
+        let project = Project::load(&fixture.path()).unwrap();
+        assert_eq!(project.files["code.ts"][0], "function submit() {}");
+        let lines = &project.diffs["code.ts"].lines;
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.kind == DiffKind::Added && line.after == Some(1))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.kind == DiffKind::Removed && line.before == Some(1))
+        );
+        fs::write(fixture.0.join("code.ts"), "intervening edit\n").unwrap();
+        assert!(
+            Project::load(&fixture.path())
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("drift")
+        );
+    }
+
+    #[test]
+    fn implemented_new_file_shows_real_additions_and_rejects_uncaptured_files() {
+        let fixture = Fixture::new();
+        let mut value = read_json(&fixture);
+        value["version"] = 2.into();
+        value["annotations"][0]["operation"] = "create_file".into();
+        value["annotations"][0]["target"] = serde_json::json!({"path":"new.ts"});
+        value["implementation"] = serde_json::json!({"files":[{"path":"new.ts","before":null,"after":"export const rule = true;\n"}]});
+        fs::write(fixture.0.join("new.ts"), "export const rule = true;\n").unwrap();
+        write_json(&fixture, &value);
+        let project = Project::load(&fixture.path()).unwrap();
+        assert!(
+            project.diffs["new.ts"]
+                .lines
+                .iter()
+                .all(|line| line.kind == DiffKind::Added)
+        );
+        assert!(project.new_files.contains("new.ts"));
+        value["implementation"]["files"].as_array_mut().unwrap().push(serde_json::json!({"path":"code.ts","before":null,"after":"function submit() {}\n"}));
+        write_json(&fixture, &value);
+        assert!(
+            Project::load(&fixture.path())
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("no annotation")
+        );
+    }
+    fn git(fixture: &Fixture, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .current_dir(&fixture.0)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    fn git_proposal(fixture: &Fixture) -> serde_json::Value {
+        git(fixture, &["init", "-q"]);
+        git(fixture, &["add", "--", "code.ts"]);
+        git(
+            fixture,
+            &[
+                "-c",
+                "user.name=Proposal Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-qm",
+                "baseline",
+            ],
+        );
+        let mut value = read_json(fixture);
+        value["version"] = 2.into();
+        value["base_commit"] = git(fixture, &["rev-parse", "HEAD"]).into();
+        value["implementation"] = serde_json::json!({"source":"git"});
+        value
+    }
+
+    #[test]
+    fn git_mode_uses_commit_and_worktree_and_never_the_index() {
+        let fixture = Fixture::new();
+        let value = git_proposal(&fixture);
+        fs::write(
+            fixture.0.join("code.ts"),
+            "function submit() { staged(); }\n",
+        )
+        .unwrap();
+        git(&fixture, &["add", "--", "code.ts"]);
+        fs::write(
+            fixture.0.join("code.ts"),
+            "function submit() { working(); }\n",
+        )
+        .unwrap();
+        write_json(&fixture, &value);
+        let project = Project::load(&fixture.path()).unwrap();
+        assert_eq!(project.files["code.ts"], ["function submit() {}"]);
+        assert!(
+            project.diffs["code.ts"]
+                .after
+                .as_ref()
+                .unwrap()
+                .contains("working()")
+        );
+        assert!(git(&fixture, &["show", ":code.ts"]).contains("staged()"));
+        let (mut review, _) = project.read_review();
+        review.notes[0]
+            .comments
+            .push("Review of working version".into());
+        project.save_review(&review).unwrap();
+        fs::write(
+            fixture.0.join("code.ts"),
+            "function submit() { newer(); }\n",
+        )
+        .unwrap();
+        let newer = Project::load(&fixture.path()).unwrap();
+        assert!(
+            newer.diffs["code.ts"]
+                .after
+                .as_ref()
+                .unwrap()
+                .contains("newer()")
+        );
+        assert!(newer.read_review().0.notes[0].comments.is_empty());
+    }
+
+    #[test]
+    fn git_mode_handles_untracked_additions_and_deleted_files_without_snapshots() {
+        let fixture = Fixture::new();
+        let mut value = git_proposal(&fixture);
+        value["annotations"][0]["operation"] = "delete".into();
+        let mut new_note = value["annotations"][0].clone();
+        new_note["id"] = "new-file".into();
+        new_note["operation"] = "create_file".into();
+        new_note["target"] = serde_json::json!({"path":"new.ts"});
+        value["annotations"].as_array_mut().unwrap().push(new_note);
+        fs::remove_file(fixture.0.join("code.ts")).unwrap();
+        fs::write(fixture.0.join("new.ts"), "export const added = true;\n").unwrap();
+        write_json(&fixture, &value);
+        let project = Project::load(&fixture.path()).unwrap();
+        assert!(project.diffs["code.ts"].after.is_none());
+        assert!(project.diffs["new.ts"].before.is_none());
+        assert!(
+            project.diffs["new.ts"]
+                .lines
+                .iter()
+                .all(|line| line.kind == DiffKind::Added)
+        );
+        value["base_commit"] = serde_json::Value::Null;
+        write_json(&fixture, &value);
+        assert!(Project::load(&fixture.path()).is_err());
     }
 }

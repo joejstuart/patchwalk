@@ -225,3 +225,49 @@ Validation exits nonzero for invalid JSON, unsupported versions, schema violatio
 invalid paths or IDs, missing source, invalid ranges, and stale anchor context. Schema
 errors include instance paths. The runtime resolves only bundled local schema refs;
 proposal data cannot supply additional schemas or cause schema network fetches.
+
+## Implemented changes: proposal version 2
+
+The default implemented-review workflow assumes the repository starts clean. Record
+its current full commit hash before editing. Set `version` to `2`, `base_commit` to
+that hash, and add:
+
+```json
+{"implementation": {"source": "git"}}
+```
+
+No file snapshots are needed. The viewer reads original files from that commit
+using Git, reads the result from the working tree, and renders the diff for the
+annotated paths. Staging is irrelevant: both staged and unstaged edits appear.
+Untracked new files and deletions are supported. No Git commands alter the index,
+branches, commits, or working files. Git must be installed and `--repo` must name the
+repository root. A full hash is required rather than a moving reference like HEAD.
+
+Existing-code anchors and evidence refer to the base commit's lines. New-file
+annotations use `create_file` and a path only. Every annotation target must actually
+have changed. The artifact is scoped to annotated paths, not all repository changes;
+producers must annotate every file belonging to the change. Handling unrelated edits
+inside these paths is outside the clean-start workflow.
+
+The code pane shows before/after line numbers and colored additions/removals.
+Annotations and comments remain available. Later working-tree edits are reflected
+on reopening; feedback fingerprints the loaded result, so previous approvals do
+not silently apply to a different working tree. The viewer does not watch files
+while open. Keep the pinned base commit available until review is complete.
+
+Use `schemas/proposal-v2.schema.json` and the provider-neutral workflow in
+`prompts/record-implemented-change.txt`. Version 1 remains supported for plans.
+
+### Optional snapshot compatibility
+
+The earlier v2 snapshot representation is still accepted:
+
+```json
+{"implementation":{"files":[{"path":"src/example.py","before":"old\n","after":"new\n"}]}}
+```
+
+This explicit snapshot mode is optional, not part of the clean-Git workflow. Values
+are complete UTF-8 file strings, with null representing absence. The viewer checks
+the checkout against captured after content and rejects drift. The Git and snapshot
+representations cannot be combined. Review feedback v1 supports both forms; its
+proposal and source digests bind feedback to the exact loaded result.

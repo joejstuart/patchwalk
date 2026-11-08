@@ -23,6 +23,15 @@ const BRIGHT: Color = Color::Reset;
 const ACCENT: Color = Color::Cyan;
 const WARM: Color = Color::Yellow;
 const GREEN: Color = Color::Green;
+// Muted diff rows, with stronger backgrounds only on changed characters.
+const DIFF_ADDED: Color = Color::Rgb(158, 203, 174);
+const DIFF_ADDED_BG: Color = Color::Rgb(38, 61, 50); // #263D32
+const DIFF_ADDED_EMPHASIS: Color = Color::Rgb(56, 108, 76);
+const DIFF_REMOVED: Color = Color::Rgb(225, 161, 170);
+const DIFF_REMOVED_BG: Color = Color::Rgb(73, 42, 50); // #492A32
+const DIFF_REMOVED_EMPHASIS: Color = Color::Rgb(132, 64, 79);
+const DIFF_TEXT: Color = Color::Rgb(220, 227, 234);
+const DIFF_GUTTER: Color = Color::Rgb(145, 157, 169);
 
 struct Row {
     text: Line<'static>,
@@ -42,16 +51,16 @@ fn simple(text: impl Into<String>, color: Color) -> Line<'static> {
     Line::from(span(text, color))
 }
 
-// Translate the cached syntax theme into the user's ANSI palette. Plain source
-// uses the default foreground so it remains readable on light and dark terminals.
+// Muted syntax palette. Plain source
+// and all backgrounds still inherit the terminal theme.
 fn syntax_color(r: u8, g: u8, b: u8) -> Color {
     match (r, g, b) {
         (101, 115, 126) => MUTED,
-        (180, 142, 173) => Color::Magenta,
-        (142, 183, 212) | (143, 161, 179) => Color::Blue,
-        (143, 188, 187) | (150, 181, 180) => Color::Cyan,
-        (163, 190, 140) => Color::Green,
-        (208, 135, 112) | (235, 203, 139) => Color::Yellow,
+        (180, 142, 173) => Color::Rgb(185, 164, 211),
+        (142, 183, 212) | (143, 161, 179) => Color::Rgb(146, 184, 215),
+        (143, 188, 187) | (150, 181, 180) => Color::Rgb(136, 193, 192),
+        (163, 190, 140) => Color::Rgb(201, 181, 139),
+        (208, 135, 112) | (235, 203, 139) => Color::Rgb(204, 169, 135),
         _ => Color::Reset,
     }
 }
@@ -334,7 +343,183 @@ fn annotation_rows(app: &App, index: usize, width: usize, rows: &mut Vec<Row>) {
     });
 }
 
+fn diff_annotation(app: &App, id: usize, width: usize, rows: &mut Vec<Row>) {
+    let start = rows.len();
+    annotation_rows(app, id, width.saturating_sub(5), rows);
+    for row in &mut rows[start..] {
+        row.text.spans.insert(0, span("     ", TEXT));
+    }
+}
+
+fn diff_rows(app: &App, width: usize) -> Vec<Row> {
+    use crate::model::DiffKind;
+    let diff = &app.project.diffs[&app.view.file];
+    let notes: Vec<_> = app
+        .project
+        .proposal
+        .annotations
+        .iter()
+        .enumerate()
+        .filter(|(_, note)| note.file == app.view.file)
+        .collect();
+    let mut rows = Vec::new();
+    let mut emitted = std::collections::HashSet::new();
+    let mut old_cursor = 1;
+    for line in &diff.lines {
+        let anchor = line.before.unwrap_or(old_cursor);
+        for (id, note) in &notes {
+            if !emitted.contains(id)
+                && (note.kind == "CREATE FILE" || (note.kind != "ADD AFTER" && note.line == anchor))
+            {
+                diff_annotation(app, *id, width, &mut rows);
+                emitted.insert(*id);
+            }
+        }
+        let (marker, color) = match line.kind {
+            DiffKind::Context => (' ', TEXT),
+            DiffKind::Added => ('+', DIFF_ADDED),
+            DiffKind::Removed => ('-', DIFF_REMOVED),
+        };
+        let old = line.before.map(|n| n.to_string()).unwrap_or_default();
+        let new = line.after.map(|n| n.to_string()).unwrap_or_default();
+        let mut spans = vec![
+            Span::styled(
+                format!("{old:>4}"),
+                Style::default()
+                    .fg(if marker == '-' { color } else { MUTED })
+                    .add_modifier(if marker == '-' {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ),
+            span(" ", MUTED),
+            Span::styled(
+                format!("{new:>4}"),
+                Style::default()
+                    .fg(if marker == '+' { color } else { MUTED })
+                    .add_modifier(if marker == '+' {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ),
+            strong(format!(" {marker} "), color),
+        ];
+        let cache = if line.kind == DiffKind::Removed {
+            &app.highlights.files
+        } else {
+            &app.highlights.after_files
+        };
+        let number = if line.kind == DiffKind::Removed {
+            line.before
+        } else {
+            line.after
+        };
+        let tokens =
+            number.and_then(|n| cache.get(&app.view.file).and_then(|lines| lines.get(n - 1)));
+        let (background, emphasis_bg, emphasis_fg) = match line.kind {
+            DiffKind::Context => (BG, BG, TEXT),
+            DiffKind::Added => (
+                DIFF_ADDED_BG,
+                DIFF_ADDED_EMPHASIS,
+                Color::Rgb(217, 255, 225),
+            ),
+            DiffKind::Removed => (
+                DIFF_REMOVED_BG,
+                DIFF_REMOVED_EMPHASIS,
+                Color::Rgb(255, 224, 229),
+            ),
+        };
+        for gutter in &mut spans {
+            gutter.style = gutter.style.bg(background);
+            if marker != ' ' && gutter.style.fg == Some(MUTED) {
+                gutter.style = gutter.style.fg(DIFF_GUTTER);
+            }
+        }
+        let fallback;
+        let tokens = if let Some(tokens) = tokens {
+            tokens.as_slice()
+        } else {
+            fallback = vec![(syntect::highlighting::Style::default(), line.text.clone())];
+            fallback.as_slice()
+        };
+        let (mut offset, mut range_index) = (0usize, 0usize);
+        for (style, text) in tokens {
+            let c = style.foreground;
+            let syntax = syntax_color(c.r, c.g, c.b);
+            let foreground = if syntax == Color::Reset && marker != ' ' {
+                DIFF_TEXT
+            } else {
+                syntax
+            };
+            for ch in text.chars() {
+                while range_index < line.emphasized.len()
+                    && line.emphasized[range_index].end <= offset
+                {
+                    range_index += 1;
+                }
+                let highlighted = line
+                    .emphasized
+                    .get(range_index)
+                    .is_some_and(|range| range.contains(&offset));
+                let paint = if highlighted {
+                    Style::default()
+                        .fg(emphasis_fg)
+                        .bg(emphasis_bg)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(foreground).bg(background)
+                };
+                if offset >= app.view.horizontal as usize {
+                    if let Some(last) = spans.last_mut().filter(|last| last.style == paint) {
+                        last.content.to_mut().push(ch);
+                    } else {
+                        spans.push(Span::styled(ch.to_string(), paint));
+                    }
+                }
+                offset += 1;
+            }
+        }
+        let used = Line::from(spans.clone()).width();
+        spans.push(Span::styled(
+            " ".repeat(width.saturating_sub(used)),
+            Style::default().bg(background),
+        ));
+        rows.push(Row {
+            text: Line::from(spans).style(Style::default().bg(background)),
+            source: line.before,
+            annotation: None,
+        });
+        if line.missing_newline && line.kind != DiffKind::Context {
+            rows.push(Row {
+                text: simple("            \\ No newline at end of file", MUTED),
+                source: None,
+                annotation: None,
+            });
+        }
+        if let Some(old_line) = line.before {
+            old_cursor = old_line + 1;
+            for (id, note) in &notes {
+                if !emitted.contains(id) && note.kind == "ADD AFTER" && note.line == old_line {
+                    diff_annotation(app, *id, width, &mut rows);
+                    emitted.insert(*id);
+                }
+            }
+        }
+    }
+    for (id, _) in notes {
+        if !emitted.contains(&id) {
+            diff_annotation(app, id, width, &mut rows);
+        }
+    }
+    rows
+}
+
 fn code_rows(app: &App, width: usize) -> Vec<Row> {
+    if !app.view.evidence && app.project.diffs.contains_key(&app.view.file) {
+        return diff_rows(app, width);
+    }
     let source = &app.project.files[&app.view.file];
     let notes = &app.project.proposal.annotations;
     let mut rows = Vec::new();
@@ -455,6 +640,8 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     );
     let state = if app.review.approved {
         "✓ APPROVED LOCALLY"
+    } else if !app.project.diffs.is_empty() {
+        "IMPLEMENTED CHANGE"
     } else {
         "SAVED PROPOSAL"
     };
@@ -790,7 +977,12 @@ fn draw_code(frame: &mut Frame, app: &mut App, area: Rect) {
         ])),
         title_areas[0],
     );
-    let role = if app.project.new_files.contains(&app.view.file) {
+    let applied = !app.view.evidence && app.project.diffs.contains_key(&app.view.file);
+    let role = if applied {
+        "Applied diff"
+    } else if app.view.evidence && app.project.diffs.contains_key(&app.view.file) {
+        "Evidence · before"
+    } else if app.project.new_files.contains(&app.view.file) {
         "Proposed new file"
     } else if app.view.evidence {
         "↗ Evidence"
@@ -805,8 +997,18 @@ fn draw_code(frame: &mut Frame, app: &mut App, area: Rect) {
         .right_aligned(),
         title_areas[1],
     );
+    let legend = if applied {
+        Line::from(vec![
+            span("  Before / After    ", MUTED),
+            strong("− Removed", DIFF_REMOVED),
+            span("    ", MUTED),
+            strong("+ Added", DIFF_ADDED),
+        ])
+    } else {
+        simple(format!("  {}", app.view.file), MUTED)
+    };
     frame.render_widget(
-        Paragraph::new(simple(format!("  {}", app.view.file), MUTED)),
+        Paragraph::new(legend),
         Rect::new(tab.x, tab.y + 1, tab.width, 1),
     );
     frame.render_widget(
@@ -882,6 +1084,8 @@ fn draw_code(frame: &mut Frame, app: &mut App, area: Rect) {
         app.review.notes.len(),
         if app.view.evidence {
             "Esc returns to proposal"
+        } else if applied {
+            "Implemented change · review only"
         } else {
             "Source unchanged"
         }
@@ -1124,15 +1328,23 @@ mod tests {
             ("overview", 110, 35, false, None),
             ("overview-compact", 80, 24, false, None),
             ("review", 110, 35, false, None),
+            ("implemented", 150, 45, false, None),
             ("footer-narrow", 65, 24, false, None),
             ("footer-wide", 160, 35, false, None),
             ("compact", 80, 24, false, None),
             ("reasoning", 110, 40, true, None),
             ("related", 110, 35, false, Some(Popup::Related(1))),
         ] {
-            let project =
+            let project = if name == "implemented" {
+                let Ok(path) = std::env::var("PROPOSAL_NAV_PREVIEW_PROPOSAL") else {
+                    continue;
+                };
+                let root = std::env::var("PROPOSAL_NAV_PREVIEW_REPO").ok();
+                Project::load_with_root(Path::new(&path), root.as_deref().map(Path::new)).unwrap()
+            } else {
                 Project::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("demo/proposal.json"))
-                    .unwrap();
+                    .unwrap()
+            };
             let mut app = App::new(project);
             // A preview must not include a user's saved review comments.
             for note in &mut app.review.notes {
@@ -1141,7 +1353,17 @@ mod tests {
             }
             app.review.approved = false;
             if !name.starts_with("overview") {
-                app.select(1, false);
+                app.select(
+                    if name == "implemented" {
+                        std::env::var("PROPOSAL_NAV_PREVIEW_ANNOTATION")
+                            .ok()
+                            .and_then(|n| n.parse().ok())
+                            .unwrap_or(0)
+                    } else {
+                        1
+                    },
+                    false,
+                );
             }
             app.view.expanded = expanded;
             app.popup = popup;
@@ -1171,6 +1393,7 @@ mod tests {
                 Color::Magenta => vec![211, 54, 130],
                 Color::Yellow => vec![181, 137, 0],
                 Color::Green => vec![133, 153, 0],
+                Color::Red => vec![220, 50, 47],
                 _ => vec![131, 148, 150],
             };
             let cells: Vec<_> = buffer
@@ -1311,6 +1534,61 @@ mod tests {
                 1
             );
             assert!(rows.iter().any(|r| r.source == Some(8)));
+        }
+    }
+    #[test]
+    fn diff_rendering_preserves_annotation_anchors_and_colored_changes() {
+        let mut project =
+            Project::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("demo/proposal.json"))
+                .unwrap();
+        let file = "src/orders/validation.ts";
+        let before = project.files[file].join("\n") + "\n";
+        let after = before.replace("length > 0", "length > 1");
+        project.diffs.insert(
+            file.into(),
+            crate::model::FileDiff::new(crate::protocol::ImplementedFile {
+                path: file.into(),
+                before: Some(before),
+                after: Some(after),
+            }),
+        );
+        let mut app = App::new(project);
+        app.select(0, false);
+        let rows = code_rows(&app, 100);
+        assert_eq!(
+            rows.iter().filter(|row| row.annotation == Some(0)).count(),
+            1
+        );
+        assert!(rows.iter().any(|row| {
+            row.text
+                .spans
+                .iter()
+                .any(|s| s.style.fg == Some(DIFF_REMOVED))
+        }));
+        assert!(rows.iter().any(|row| {
+            row.text
+                .spans
+                .iter()
+                .any(|s| s.style.fg == Some(DIFF_ADDED))
+        }));
+        for (background, emphasis, character) in [
+            (DIFF_ADDED_BG, DIFF_ADDED_EMPHASIS, "1"),
+            (DIFF_REMOVED_BG, DIFF_REMOVED_EMPHASIS, "0"),
+        ] {
+            let row = rows
+                .iter()
+                .find(|row| row.text.style.bg == Some(background))
+                .unwrap();
+            assert!(row.text.width() >= 100);
+            assert_eq!(row.text.spans.last().unwrap().style.bg, Some(background));
+            let highlighted: String = row
+                .text
+                .spans
+                .iter()
+                .filter(|span| span.style.bg == Some(emphasis))
+                .map(|span| span.content.as_ref())
+                .collect();
+            assert_eq!(highlighted, character);
         }
     }
 }

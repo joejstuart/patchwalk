@@ -52,7 +52,22 @@ pub struct App {
 
 impl App {
     pub fn new(project: Project) -> Self {
-        let highlights = crate::highlight::SourceCache::new(&project.files);
+        let after = project
+            .diffs
+            .iter()
+            .map(|(path, diff)| {
+                (
+                    path.clone(),
+                    diff.after
+                        .as_deref()
+                        .unwrap_or("")
+                        .lines()
+                        .map(|line| line.replace('\t', "    "))
+                        .collect(),
+                )
+            })
+            .collect();
+        let highlights = crate::highlight::SourceCache::new(&project.files, &after);
         let file = project.proposal.annotations[0].file.clone();
         let target_line = project.proposal.annotations[0].line;
         let (review, message) = project.read_review();

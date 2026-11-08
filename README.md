@@ -22,7 +22,11 @@ The canvas and ordinary text inherit your terminal's default background and
 foreground, including light themes and transparency. ANSI colors use your terminal
 palette: cyan for navigation, yellow for proposal outlines, and green for reviewed
 items. Pane dividers remain explicit; selected entries use a marker and bold text
-rather than a background fill. Source syntax colors also use the ANSI palette.
+rather than a background fill. Diff additions use a muted green background
+(`#263D32`), and deletions use muted red (`#492A32`). Stronger green and red
+highlights mark the exact characters changed within replacement lines. Syntax
+coloring is retained on both sides, with sand-colored strings and soft lavender
+keywords. Unchanged code inherits the terminal background.
 
 ## A short walkthrough
 
@@ -131,3 +135,20 @@ navigation prototype, not a large-repository performance benchmark: it still
 constructs the current file's display rows on each input event. Syntax colors are cached at load time. TypeScript excerpts use the bundled JavaScript
 grammar as a fallback. Large-file virtualization, live proposal revisions, and agent
 integration are outside the current scope.
+
+## Review an implemented change
+
+Assume the repository starts clean. Record the current Git commit, implement the
+change, and write a v2 proposal with that hash as `base_commit` and
+`"implementation": {"source":"git"}`. The viewer obtains the before version from
+Git and the after version from the working tree. No snapshots are required; staging
+is optional, and new untracked files are supported.
+
+The code pane shows the diff for annotated paths, alongside explanations and inline
+comments. Later source edits invalidate older saved approvals when reopened.
+Version 1 remains available for pre-implementation plans. Earlier explicit snapshot
+bundles are also still readable.
+
+See [implemented-change schema](schemas/proposal-v2.schema.json),
+[format details](PROTOCOL.md#implemented-changes-proposal-version-2), and the
+[generic recording prompt](prompts/record-implemented-change.txt).

@@ -1,4 +1,5 @@
 mod app;
+mod git_baseline;
 mod highlight;
 mod model;
 mod protocol;
@@ -36,7 +37,7 @@ fn start() -> Result<()> {
         match arg.as_str() {
             "--help" | "-h" => {
                 println!(
-                    "Usage: proposal-nav [proposal.json] [--repo DIRECTORY] [--check]\n\nWithout a path, opens the bundled demo.\n--repo selects the source root; defaults to the proposal's directory.\n--check validates the v1 schema, IDs, paths, ranges, and source context without opening the UI.\nIn the UI, press ? for navigation help. q saves feedback beside the proposal."
+                    "Usage: proposal-nav [proposal.json] [--repo DIRECTORY] [--check]\n\nWithout a path, opens the bundled demo.\n--repo selects the source root; defaults to the proposal's directory.\n--check validates the v1/v2 schema, IDs, paths, ranges, and source context without opening the UI.\nIn the UI, press ? for navigation help. q saves feedback beside the proposal."
                 );
                 return Ok(());
             }
@@ -60,7 +61,8 @@ fn start() -> Result<()> {
     };
     if check {
         println!(
-            "Valid proposal v1: {}\nID: {} · revision {}\n{} annotations across {} loaded files\nBase commit: {}\nFeedback: {}",
+            "Valid proposal v{}: {}\nID: {} · revision {}\n{} annotations across {} loaded files\nBase commit: {}\nFeedback: {}",
+            project.proposal.version,
             project.proposal.title,
             project.proposal.id,
             project.proposal.revision,

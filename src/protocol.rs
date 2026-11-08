@@ -6,8 +6,10 @@ use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
 
 pub const PROPOSAL_SCHEMA: &str = include_str!("../schemas/proposal-v1.schema.json");
+pub const IMPLEMENTED_SCHEMA: &str = include_str!("../schemas/proposal-v2.schema.json");
 pub const REVIEW_SCHEMA: &str = include_str!("../schemas/review-v1.schema.json");
 static PROPOSAL_VALIDATOR: OnceLock<jsonschema::Validator> = OnceLock::new();
+static IMPLEMENTED_VALIDATOR: OnceLock<jsonschema::Validator> = OnceLock::new();
 static REVIEW_VALIDATOR: OnceLock<jsonschema::Validator> = OnceLock::new();
 
 fn validate(value: &Value, schema: &str, cache: &OnceLock<jsonschema::Validator>) -> Result<()> {
@@ -33,12 +35,11 @@ pub fn validate_review(value: &Value) -> Result<()> {
 }
 
 pub fn parse_proposal(value: &Value) -> Result<Document> {
-    if value.get("version").and_then(Value::as_u64) != Some(1) {
-        return Err(
-            "Expected proposal version 1; unversioned and other versions are not supported".into(),
-        );
+    match value.get("version").and_then(Value::as_u64) {
+        Some(1) => validate(value, PROPOSAL_SCHEMA, &PROPOSAL_VALIDATOR)?,
+        Some(2) => validate(value, IMPLEMENTED_SCHEMA, &IMPLEMENTED_VALIDATOR)?,
+        _ => return Err("Expected proposal version 1 or 2".into()),
     }
-    validate(value, PROPOSAL_SCHEMA, &PROPOSAL_VALIDATOR)?;
     Ok(serde_json::from_value(value.clone())?)
 }
 
@@ -70,6 +71,8 @@ pub fn digest(value: &Value) -> String {
 
 #[derive(Deserialize)]
 pub struct Document {
+    pub version: u8,
+    pub implementation: Option<Implementation>,
     pub id: String,
     pub revision: u64,
     pub title: String,
@@ -117,4 +120,16 @@ pub enum Related {
         label: String,
         target: Target,
     },
+}
+
+#[derive(Deserialize)]
+pub struct Implementation {
+    pub files: Option<Vec<ImplementedFile>>,
+    pub source: Option<String>,
+}
+#[derive(Deserialize)]
+pub struct ImplementedFile {
+    pub path: String,
+    pub before: Option<String>,
+    pub after: Option<String>,
 }
