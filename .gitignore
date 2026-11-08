@@ -4,5 +4,3 @@ __pycache__/
 target/
 *.review.json
 *.review.json.tmp
-/proposals/minillm/implementation-stage/
-/proposals/minillm/implementation-before/

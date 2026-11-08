@@ -23,6 +23,7 @@ pub struct View {
 pub enum Popup {
     Help,
     Related(usize),
+    Comments(usize),
 }
 
 pub struct CommentDraft {
@@ -31,6 +32,7 @@ pub struct CommentDraft {
     pub text: String,
     pub cursor: usize, // UTF-8 byte boundary, independent of terminal cell width.
     pub editing: bool,
+    pub edit_index: Option<usize>,
     previous_focus: Focus,
 }
 
@@ -43,7 +45,7 @@ pub struct App {
     pub popup: Option<Popup>,
     pub comment: Option<CommentDraft>,
     pub recenter: bool,
-    pub message: String,
+    pub notice: Option<String>,
     pub dirty: bool,
     pub quit: bool,
     pub page_height: usize,
@@ -72,6 +74,7 @@ impl App {
         let file = project.proposal.annotations[0].file.clone();
         let target_line = project.proposal.annotations[0].line;
         let (review, message) = project.read_review();
+        let notice = (review.stale || review.load_failed).then_some(message);
         Self {
             project,
             highlights,
@@ -91,13 +94,17 @@ impl App {
             popup: None,
             comment: None,
             recenter: true,
-            message,
+            notice,
             dirty: false,
             quit: false,
             page_height: 10,
             row_count: 0,
             popup_scroll: 0,
         }
+    }
+
+    pub fn notify(&mut self, message: String) {
+        self.notice = Some(message);
     }
 
     pub fn select(&mut self, index: usize, remember: bool) {
@@ -193,29 +200,30 @@ impl App {
             Ok(()) => {
                 self.review = self.project.read_review().0;
                 self.dirty = false;
-                self.message = format!(
+                self.notify(format!(
                     "Saved feedback to {} · Source unchanged",
                     self.project
                         .state_path
                         .file_name()
                         .unwrap_or_default()
                         .to_string_lossy()
-                );
+                ));
             }
-            Err(e) => self.message = format!("Save failed: {e}"),
+            Err(e) => self.notify(format!("Save failed: {e}")),
         }
     }
 
     pub fn reload(&mut self) {
         if self.dirty || self.comment.is_some() {
-            self.message =
-                "Reload paused · save feedback with s and finish or cancel your draft first".into();
+            self.notify(
+                "Reload paused · save feedback with s and finish or cancel your draft first".into(),
+            );
             return;
         }
         let project = match self.project.reload() {
             Ok(project) => project,
             Err(error) => {
-                self.message = format!("Reload failed · current view retained: {error}");
+                self.notify(format!("Reload failed · current view retained: {error}"));
                 return;
             }
         };
@@ -233,7 +241,10 @@ impl App {
             fresh.view.focus = self.view.focus;
             fresh.history.clear();
         }
-        fresh.message = format!("Reloaded proposal and source · {}", fresh.message);
+        fresh.notify(format!(
+            "Reloaded proposal and source · {}",
+            fresh.notice.as_deref().unwrap_or("review ready")
+        ));
         *self = fresh;
     }
 
@@ -242,8 +253,9 @@ impl App {
         if self.project.assert_current().is_err() {
             self.review.stale = true;
             self.review.approved = false;
-            self.message =
-                "Code or proposal changed · previous approvals stale · R reloads code".into();
+            self.notify(
+                "Code or proposal changed · previous approvals stale · R reloads code".into(),
+            );
             return;
         }
         let (fresh, message) = self.project.read_review();
@@ -253,12 +265,13 @@ impl App {
         {
             if self.dirty || self.comment.is_some() {
                 self.review.approved = false;
-                self.message =
+                self.notify(
                     "Shared review changed · local draft retained · save will check for conflicts"
-                        .into();
+                        .into(),
+                );
             } else {
+                self.notice = (fresh.stale || fresh.load_failed).then_some(message);
                 self.review = fresh;
-                self.message = message;
             }
         }
     }
@@ -395,6 +408,13 @@ impl App {
                 self.review.approval_changed = true;
                 self.dirty = true;
             }
+            KeyCode::Char('e') => {
+                if self.current_comments().is_empty() {
+                    self.notify("No comments here yet · c adds a comment".into());
+                } else {
+                    self.popup = Some(Popup::Comments(0));
+                }
+            }
             KeyCode::Char('c') => {
                 self.comment = Some(CommentDraft {
                     overview: self.view.overview,
@@ -402,6 +422,7 @@ impl App {
                     text: String::new(),
                     cursor: 0,
                     editing: true,
+                    edit_index: None,
                     previous_focus: self.view.focus,
                 });
                 self.view.focus = Focus::Code;
@@ -411,8 +432,9 @@ impl App {
                 self.review.approved = !self.review.approved;
                 self.review.approval_changed = true;
                 self.dirty = true;
-                self.message =
-                    "Approval is local review metadata; no implementation is triggered".into();
+                self.notify(
+                    "Approval is local review metadata; no implementation is triggered".into(),
+                );
             }
             KeyCode::Char('s') => self.save(),
             KeyCode::Char('R') => self.reload(),
@@ -432,7 +454,7 @@ impl App {
             KeyCode::Esc => {
                 let draft = self.comment.take().unwrap();
                 self.view.focus = draft.previous_focus;
-                self.message = "Comment canceled".into();
+                self.notify("Comment canceled".into());
             }
             KeyCode::Tab | KeyCode::BackTab => {
                 let draft = self.comment.as_mut().unwrap();
@@ -448,20 +470,49 @@ impl App {
                         return;
                     }
                     let draft = self.comment.take().unwrap();
-                    if draft.overview {
-                        self.review
-                            .overview_comments
-                            .push(draft.text.trim().to_owned());
+                    let body = draft.text.trim().to_owned();
+                    if let Some(index) = draft.edit_index {
+                        let old = if draft.overview {
+                            &self.review.overview_comments[index]
+                        } else {
+                            &self.review.notes[draft.annotation].comments[index]
+                        };
+                        let mut display = body.clone();
+                        if let Some(source) = self.review.comment_sources.get(old).cloned() {
+                            if source.author != "human" {
+                                self.notify("Only your own comments can be edited".into());
+                                return;
+                            }
+                            self.review
+                                .comment_edits
+                                .insert(source.id.clone(), body.clone());
+                            let mut changed = source.clone();
+                            changed.body = body;
+                            display = crate::review::display_comment(&changed);
+                            self.review.comment_sources.insert(display.clone(), source);
+                        }
+                        if draft.overview {
+                            self.review.overview_comments[index] = display;
+                        } else {
+                            self.review.notes[draft.annotation].comments[index] = display;
+                        }
+                    } else if draft.overview {
+                        self.review.overview_comments.push(body);
                     } else {
-                        self.review.notes[draft.annotation]
-                            .comments
-                            .push(draft.text.trim().to_owned());
+                        self.review.notes[draft.annotation].comments.push(body);
                     }
                     self.review.approved = false;
                     self.review.approval_changed = true;
                     self.dirty = true;
                     self.view.focus = draft.previous_focus;
-                    self.message = "Comment added · s saves feedback".into();
+                    self.notify(
+                        if draft.edit_index.is_some() {
+                            "Comment updated · s saves feedback"
+                        } else {
+                            "Comment added · s saves feedback"
+                        }
+                        .into(),
+                    );
                     return;
                 }
                 let draft = self.comment.as_mut().unwrap();
@@ -528,9 +579,78 @@ impl App {
         }
     }
 
+    pub fn current_comments(&self) -> &[String] {
+        if self.view.overview {
+            &self.review.overview_comments
+        } else {
+            &self.review.notes[self.view.selected].comments
+        }
+    }
+
+    pub fn comment_body(&self, index: usize) -> &str {
+        let display = &self.current_comments()[index];
+        if let Some(source) = self.review.comment_sources.get(display) {
+            self.review
+                .comment_edits
+                .get(&source.id)
+                .unwrap_or(&source.body)
+        } else {
+            display
+        }
+    }
+
+    pub fn comment_editable(&self, index: usize) -> bool {
+        self.current_comments().get(index).is_some_and(|text| {
+            self.review
+                .comment_sources
+                .get(text)
+                .is_none_or(|source| source.author == "human")
+        })
+    }
+
+    fn edit_comment(&mut self, index: usize) {
+        if !self.comment_editable(index) {
+            self.notify("Only your own comments can be edited".into());
+            self.popup = None;
+            return;
+        }
+        let text = self.comment_body(index).to_owned();
+        self.comment = Some(CommentDraft {
+            overview: self.view.overview,
+            annotation: self.view.selected,
+            cursor: text.len(),
+            text,
+            editing: true,
+            edit_index: Some(index),
+            previous_focus: self.view.focus,
+        });
+        self.popup = None;
+        self.view.focus = Focus::Code;
+        self.recenter = false;
+    }
+
     fn popup_key(&mut self, key: KeyCode) {
         if key == KeyCode::Esc {
             self.popup = None;
+            return;
+        }
+        if let Some(Popup::Comments(selected)) = self.popup.as_ref() {
+            let count = self.current_comments().len();
+            if count == 0 {
+                self.popup = None;
+                return;
+            }
+            let selected = (*selected).min(count - 1);
+            match key {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.popup = Some(Popup::Comments((selected + 1) % count))
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.popup = Some(Popup::Comments((selected + count - 1) % count))
+                }
+                KeyCode::Enter | KeyCode::Char('e') => self.edit_comment(selected),
+                _ => {}
+            }
             return;
         }
         match self.popup.as_mut().unwrap() {
@@ -606,7 +726,12 @@ mod tests {
 
         std::fs::write(&path, "invalid JSON").unwrap();
         app.reload();
-        assert!(app.message.starts_with("Reload failed"));
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("Reload failed")
+        );
         assert_eq!(app.project.proposal.revision, 2);
         assert_eq!(app.view.selected, 0);
         std::fs::remove_file(path).unwrap();
@@ -620,14 +745,24 @@ mod tests {
         app.reload();
         assert!(app.dirty);
         assert_eq!(app.review.notes[1].status, Status::Flagged);
-        assert!(app.message.starts_with("Reload paused"));
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("Reload paused")
+        );
 
         app.dirty = false;
         app.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
         app.paste("Keep this draft");
         app.reload();
         assert_eq!(app.comment.as_ref().unwrap().text, "Keep this draft");
-        assert!(app.message.starts_with("Reload paused"));
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("Reload paused")
+        );
     }
 
     #[test]

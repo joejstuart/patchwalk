@@ -38,8 +38,8 @@ export PATH="$HOME/.local/bin:$PATH"
 Override destinations with `--bin-dir DIRECTORY` and `--skill-dir DIRECTORY`,
 or use `--without-skill` for the viewer alone. Re-run the installer to update.
 To uninstall, remove the installed binary and `patchwalk` skill directory.
-The launcher `./run.sh` also works without installation. Both scripts use this
-workspace's isolated Rust toolchain when available, otherwise Cargo on PATH.
+The launcher `./run.sh` also works without installation. Both scripts require
+Cargo on PATH.
 For a fresh machine, install Rust from [rustup.rs](https://rustup.rs) first.
 The first build takes longer. macOS and Linux are the supported shell-install
 paths; no prebuilt release downloads are published by this checkout.
@@ -205,6 +205,7 @@ with your previous position preserved.
 | `o` | Return directly to overview |
 | `v` / `f` | Toggle an annotation's reviewed / flagged status |
 | `c` | Draft an inline comment on the selected change or overview |
+| `e` | View comments, select with arrows, and Enter to edit your own comment |
 | `a` | Toggle whole-change approval as review metadata |
 | `s` | Save review metadata |
 | `R` | Reload proposal and source after saving feedback |
@@ -219,13 +220,18 @@ between runs.
 
 ### Write comments beside the code
 
+Comment counts appear beside changes in the sidebar and on the selected change.
+Press `e` to open the comments list, use up/down to select, and press Enter to
+edit your own comment. The editor contains only your text; metadata and the
+comment target are preserved. Other authors' comments remain read-only.
+
 Press `c` to open a docked editor beneath the code and explanation, or beneath
 the overview. Its title identifies the target. The context stays visible while
 you write.
 
 | Key while drafting | Action |
 | --- | --- |
-| `Enter` | Add a nonblank comment to the in-memory review |
+| `Enter` | Add or update a nonblank comment in the in-memory review |
 | `Esc` | Discard the unfinished draft |
 | `Tab` | Switch between writing and reading context |
 | Up/down, `PgUp/PgDn` | Scroll context without moving the comment's target |
@@ -236,7 +242,8 @@ you write.
 Pasted paragraphs preserve newlines and wrap; pasting does not submit a comment.
 Navigation to other annotations is held while a draft is open. Added comments
 appear even when reasoning is collapsed. Press `s` or `q` to persist them; an
-unfinished or canceled draft is not saved.
+unfinished or canceled draft is not saved. Edits use the same save and conflict
+checks as new comments and clear approval.
 
 ## Local review history
 
@@ -345,5 +352,6 @@ nonregular source entries are rejected; symlink review is unsupported.
 
 The terminal preserves raw source separately from display text; tab expansion
 is presentation only. Saved history retains proposal and source snapshots for
-provenance, including legacy snapshots already on disk. History has no public
-agent API. The source fingerprint change may make older approvals stale.
+provenance. New rounds store canonical inputs without derived proposal summaries
+or display/diff line arrays; existing historical snapshots remain intact. History
+has no public agent API. The source fingerprint change may make older approvals stale.

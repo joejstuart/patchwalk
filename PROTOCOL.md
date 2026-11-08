@@ -268,7 +268,9 @@ invalidate approval even when text is unchanged. Working-tree symlinks and other
 nonregular source entries are rejected; symlink review is unsupported.
 
 Raw source is retained separately from terminal display text. Saved history
-preserves exact source and the original proposal JSON for provenance. No command
+preserves exact source, working-tree modes, and the original proposal JSON for
+provenance. New rounds omit reconstructed summaries and display/diff line arrays;
+existing historical context objects are retained unchanged. No command
 exports context or accepts reviewer submissions; humans review through the TUI.
 
 ## Generated implemented-review scaffolds

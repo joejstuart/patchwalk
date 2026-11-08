@@ -65,6 +65,10 @@ fn syntax_color(r: u8, g: u8, b: u8) -> Color {
     }
 }
 
+fn comment_count(count: usize) -> String {
+    format!("{count} comment{}", if count == 1 { "" } else { "s" })
+}
+
 fn filename(path: &str) -> String {
     Path::new(path)
         .file_name()
@@ -79,7 +83,18 @@ type Binding = (&'static str, &'static str);
 fn footer_bindings(app: &App, columns: usize) -> (Vec<Binding>, Vec<Binding>) {
     if let Some(draft) = &app.comment {
         let top = if draft.editing {
-            vec![("Enter", "Add"), ("Tab", "Read"), ("Esc", "Cancel")]
+            vec![
+                (
+                    "Enter",
+                    if draft.edit_index.is_some() {
+                        "Update"
+                    } else {
+                        "Add"
+                    },
+                ),
+                ("Tab", "Read"),
+                ("Esc", "Cancel"),
+            ]
         } else {
             vec![("Tab", "Write"), ("w", "Reason"), ("Esc", "Cancel")]
         };
@@ -97,8 +112,7 @@ fn footer_bindings(app: &App, columns: usize) -> (Vec<Binding>, Vec<Binding>) {
             ("Enter", "Open"),
             ("↑↓", "Select"),
             ("Tab", "Pane"),
-            ("n/p", "Notes"),
-            ("c", "Comment"),
+            ("c/e", "Comments"),
         ];
         let bottom = if columns < 4 {
             vec![("a", "Approve"), ("?", "Help"), ("q", "Quit")]
@@ -120,15 +134,15 @@ fn footer_bindings(app: &App, columns: usize) -> (Vec<Binding>, Vec<Binding>) {
         ("Esc", "Back"),
     ];
     let bottom = match columns {
-        1..=3 => vec![("c", "Comment"), ("?", "Help"), ("q", "Quit")],
+        1..=3 => vec![("c/e", "Comments"), ("?", "Help"), ("q", "Quit")],
         4 => vec![
-            ("c", "Comment"),
+            ("c/e", "Comments"),
             ("v", "Review"),
             ("?", "Help"),
             ("q", "Quit"),
         ],
         _ => vec![
-            ("c", "Comment"),
+            ("c/e", "Comments"),
             ("v", "Review"),
             ("f", "Flag"),
             ("?", "Help"),
@@ -302,6 +316,19 @@ fn annotation_rows(app: &App, index: usize, width: usize, rows: &mut Vec<Row>) {
         Some(index),
         false,
     );
+    let count = app.review.notes[index].comments.len();
+    if !compact {
+        card_text(
+            rows,
+            &format!(
+                "{} · {}",
+                comment_count(count),
+                if count == 0 { "c add" } else { "e view/edit" }
+            ),
+            width,
+            ACCENT,
+        );
+    }
     for title in textwrap::wrap(&note.title, width.saturating_sub(12).max(8)) {
         card_row(rows, vec![strong(title.into_owned(), BRIGHT)], width, None);
     }
@@ -328,13 +355,17 @@ fn annotation_rows(app: &App, index: usize, width: usize, rows: &mut Vec<Row>) {
         card_row(rows, vec![], width, None);
     }
     let hint = if compact {
-        "w why  ·  r related"
+        format!(
+            "{} · {}",
+            comment_count(count),
+            if count == 0 { "c add" } else { "e edit" }
+        )
     } else if app.view.expanded {
-        "w collapse  ·  r explore code"
+        "w collapse  ·  r explore code".into()
     } else {
-        "w why here  ·  r explore code"
+        "w why here  ·  r explore code".into()
     };
-    card_text(rows, hint, width, MUTED);
+    card_text(rows, &hint, width, MUTED);
     if !compact {
         card_row(rows, vec![], width, None);
     }
@@ -636,7 +667,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         .split(Rect { height: 1, ..inner });
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            strong("◈  PROPOSAL NAV", ACCENT),
+            strong("◈  PATCHWALK", ACCENT),
             span("   /   REVIEW", MUTED),
         ])),
         columns[0],
@@ -698,10 +729,30 @@ fn draw_outline(frame: &mut Frame, app: &App, area: Rect, compact: bool) {
     let overview_style = Style::default().bg(BG);
     let mut overview = vec![Line::from(vec![
         span(if app.view.overview { "▎ " } else { "  " }, ACCENT),
-        strong("◎ Overview", if app.view.overview { BRIGHT } else { TEXT }),
+        strong(
+            format!(
+                "◎ Overview{}",
+                if app.review.overview_comments.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · {}", app.review.overview_comments.len())
+                }
+            ),
+            if app.view.overview { BRIGHT } else { TEXT },
+        ),
     ])];
     if !compact {
-        overview.push(simple("    Goal and approach", MUTED));
+        overview.push(simple(
+            if app.review.overview_comments.is_empty() {
+                "    Goal and approach".into()
+            } else {
+                format!(
+                    "    {} · e",
+                    comment_count(app.review.overview_comments.len())
+                )
+            },
+            MUTED,
+        ));
     }
     frame.render_widget(
         Paragraph::new(overview).style(overview_style),
@@ -751,6 +802,10 @@ fn draw_outline(frame: &mut Frame, app: &App, area: Rect, compact: bool) {
                     spans.push(span(format!(" {status}"), status_color));
                 }
                 lines.push(Line::from(spans));
+            }
+            let count = app.review.notes[i].comments.len();
+            if count > 0 {
+                lines.push(simple(format!("   {} · e", comment_count(count)), ACCENT));
             }
             if !compact {
                 let path = filename(&note.file);
@@ -841,6 +896,15 @@ fn draw_overview(frame: &mut Frame, app: &mut App, area: Rect) {
     );
     let width = content.width.max(1) as usize;
     let mut lines = Vec::new();
+    if !app.review.overview_comments.is_empty() {
+        lines.push(simple(
+            format!(
+                "{} · e view/edit",
+                comment_count(app.review.overview_comments.len())
+            ),
+            ACCENT,
+        ));
+    }
     for (heading, text) in [
         ("THE GOAL", &app.project.proposal.request),
         ("THE APPROACH", &app.project.proposal.summary),
@@ -972,9 +1036,8 @@ fn draw_overview(frame: &mut Frame, app: &mut App, area: Rect) {
         ),
         content,
     );
-    let transient = !app.message.starts_with("Read-only") && app.message != "Loaded saved review";
-    let hint = if transient {
-        format!("  {}", app.message)
+    let hint = if let Some(notice) = &app.notice {
+        format!("  {notice}")
     } else if app.view.scroll + app.page_height < app.row_count {
         "  ↓ More below  ·  Tab + ↑↓ selects a change".into()
     } else {
@@ -1127,9 +1190,8 @@ fn draw_code(frame: &mut Frame, app: &mut App, area: Rect) {
             "Source unchanged"
         }
     );
-    let transient = !app.message.starts_with("Read-only") && app.message != "Loaded saved review";
-    let info = if transient {
-        format!("  {}", app.message)
+    let info = if let Some(notice) = &app.notice {
+        format!("  {notice}")
     } else {
         location
     };
@@ -1179,7 +1241,17 @@ fn draw_comment(frame: &mut Frame, app: &App, area: Rect) {
     let note = &app.project.proposal.annotations[draft.annotation];
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .title(if draft.overview {
+        .title(if let Some(index) = draft.edit_index {
+            format!(
+                " Edit comment {} · {} ",
+                index + 1,
+                if draft.overview {
+                    "Overview".into()
+                } else {
+                    format!("{:02} {}", draft.annotation + 1, note.title)
+                }
+            )
+        } else if draft.overview {
             " Comment · Overview ".into()
         } else {
             format!(" Comment · {:02} {} ", draft.annotation + 1, note.title)
@@ -1260,12 +1332,15 @@ fn draw_popup(frame: &mut Frame, app: &mut App) {
     let title = match app.popup.as_ref().unwrap() {
         Popup::Related(_) => "Related code",
         Popup::Help => "Keyboard shortcuts",
+        Popup::Comments(_) => "Comments · select one to edit",
     };
     frame.render_widget(
         Paragraph::new(Line::from(strong(title, BRIGHT))),
         sections[0],
     );
-    let instructions = if is_related {
+    let instructions = if matches!(app.popup, Some(Popup::Comments(_))) {
+        "↑↓ select    Enter/e edit    Esc close"
+    } else if is_related {
         "↑↓ select    Enter follow    Esc close"
     } else {
         "↑↓ scroll    Esc close"
@@ -1304,6 +1379,47 @@ fn draw_popup(frame: &mut Frame, app: &mut App) {
         );
         return;
     }
+    if let Some(Popup::Comments(selected)) = app.popup.as_ref() {
+        let items: Vec<_> = app
+            .current_comments()
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                let mut lines = vec![Line::from(strong(
+                    format!(
+                        "{} · {}",
+                        index + 1,
+                        if app.comment_editable(index) {
+                            "Your comment · Enter to edit"
+                        } else {
+                            "Read-only comment"
+                        }
+                    ),
+                    ACCENT,
+                ))];
+                lines.extend(
+                    textwrap::wrap(
+                        app.comment_body(index),
+                        sections[1].width.saturating_sub(3).max(1) as usize,
+                    )
+                    .into_iter()
+                    .take(4)
+                    .map(|line| simple(line.into_owned(), TEXT)),
+                );
+                lines.push(Line::from(""));
+                ListItem::new(lines)
+            })
+            .collect();
+        let mut state = ListState::default().with_selected(Some(*selected));
+        frame.render_stateful_widget(
+            List::new(items)
+                .highlight_symbol("▎ ")
+                .highlight_style(Style::default().add_modifier(Modifier::BOLD)),
+            sections[1],
+            &mut state,
+        );
+        return;
+    }
     let mut lines = Vec::new();
     let width = sections[1].width.max(1) as usize;
     match app.popup.as_ref().unwrap() {
@@ -1319,7 +1435,7 @@ fn draw_popup(frame: &mut Frame, app: &mut App) {
                 ),
                 (
                     "REVIEW",
-                    "v   Toggle reviewed    f   Toggle flag\nc   Comment in place   a   Toggle approval\ns   Save feedback      q   Save and quit\nCtrl+C  Quit without saving",
+                    "v   Toggle reviewed    f   Toggle flag\nc   Add comment        e   View/edit comments\na   Toggle approval\ns   Save feedback      q   Save and quit\nCtrl+C  Quit without saving",
                 ),
             ] {
                 lines.push(Line::from(strong(heading, WARM)));
@@ -1335,7 +1451,7 @@ fn draw_popup(frame: &mut Frame, app: &mut App) {
             lines.extend(textwrap::wrap("Source is read-only. Approval is local metadata; no LLM is connected. Review edits clear approval.", width)
                 .into_iter().map(|s| simple(s.into_owned(), MUTED)));
         }
-        Popup::Related(_) => unreachable!(),
+        Popup::Related(_) | Popup::Comments(_) => unreachable!(),
     }
     let max_scroll = lines
         .len()
@@ -1522,6 +1638,75 @@ mod tests {
     }
 
     #[test]
+    fn fresh_and_reopened_reviews_show_hints_without_hiding_notices() {
+        let demo = crate::bundled::Demo::create().unwrap();
+        let path = demo.0.join("proposal.json");
+        let render = |app: &mut App| {
+            let mut terminal = Terminal::new(TestBackend::new(110, 35)).unwrap();
+            terminal.draw(|frame| draw(frame, app)).unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        };
+        for _ in 0..2 {
+            let mut app = App::new(Project::load(&path).unwrap());
+            assert!(app.notice.is_none());
+            let text = render(&mut app);
+            assert!(text.contains("More below") || text.contains("Enter opens a change"));
+            app.select(0, false);
+            assert!(render(&mut app).contains("Source unchanged"));
+            app.notify("Save failed: example error".into());
+            assert!(render(&mut app).contains("Save failed: example error"));
+            app.project.save_review(&app.review).unwrap();
+        }
+        std::fs::write(path.with_extension("review.json"), "{broken").unwrap();
+        let mut app = App::new(Project::load(&path).unwrap());
+        assert!(app.review.load_failed);
+        assert!(render(&mut app).contains("Could not load review"));
+    }
+
+    #[test]
+    fn comment_counts_and_selection_are_visible_at_small_and_large_sizes() {
+        for (width, height) in [(80, 24), (110, 35)] {
+            let demo = crate::bundled::Demo::create().unwrap();
+            let mut app = App::new(Project::load(&demo.0.join("proposal.json")).unwrap());
+            app.select(0, false);
+            app.review.notes[0]
+                .comments
+                .push("My visible comment".into());
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(text.contains("1 comment"));
+            app.key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('e'),
+                crossterm::event::KeyModifiers::NONE,
+            ));
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(text.contains("Comments · select one to edit"));
+            assert!(text.contains("My visible comment"));
+            assert!(text.contains("Enter/e edit"));
+        }
+    }
+
+    #[test]
     fn renders_annotation_at_small_and_large_sizes() {
         for (width, height, selected) in [(65, 16, 0), (80, 24, 1), (100, 30, 0), (160, 50, 0)] {
             let project = Project::load(
@@ -1540,7 +1725,7 @@ mod tests {
                 buffer.content.iter().all(|cell| cell.bg == Color::Reset),
                 "All surfaces should inherit the terminal background"
             );
-            assert!(text.contains("PROPOSAL NAV"));
+            assert!(text.contains("PATCHWALK"));
             assert!(text.contains(if selected == 0 {
                 "ADD AFTER"
             } else {

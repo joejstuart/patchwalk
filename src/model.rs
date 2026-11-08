@@ -630,6 +630,10 @@ pub struct Review {
     pub(crate) original_overview_comments: Vec<String>,
     #[serde(skip)]
     pub(crate) load_failed: bool,
+    #[serde(skip)]
+    pub(crate) comment_sources: HashMap<String, crate::review::Comment>,
+    #[serde(skip)]
+    pub(crate) comment_edits: HashMap<String, String>,
 }
 
 impl Review {
@@ -659,6 +663,8 @@ impl Review {
             original_comments: vec![],
             original_overview_comments: vec![],
             load_failed: false,
+            comment_sources: HashMap::new(),
+            comment_edits: HashMap::new(),
         }
     }
 }
@@ -1120,6 +1126,12 @@ mod tests {
                 .iter()
                 .any(|line| line.kind == DiffKind::Removed && line.before == Some(1))
         );
+        project.save_review(&project.read_review().0).unwrap();
+        let history = crate::review::History::load(&project).unwrap();
+        let saved = &history.rounds[0].context["files"][0];
+        assert_eq!(saved["before"], before);
+        assert_eq!(saved["after"], after);
+        assert!(saved.get("lines").is_none());
         fs::write(fixture.0.join("code.ts"), "intervening edit\n").unwrap();
         assert!(
             Project::load(&fixture.path())
@@ -1323,6 +1335,13 @@ mod tests {
             history.rounds[0].context["proposal_document"],
             read_json(&fixture)
         );
+        let context = &history.rounds[0].context;
+        assert_eq!(
+            context["files"][0]["content"],
+            "function submit() {}\r\n\t// evidence\r\n"
+        );
+        assert!(context.get("proposal").is_none());
+        assert!(context["files"][0].get("source").is_none());
         for contents in [
             "function submit() {}\n\t// evidence\n",
             "function submit() {}\r\n\t// evidence",
@@ -1336,6 +1355,174 @@ mod tests {
                     .stale
             );
         }
+    }
+
+    #[test]
+    fn terminal_edits_saved_comments_without_changing_identity_or_target() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let fixture = Fixture::new();
+        let mut app = crate::app::App::new(Project::load(&fixture.path()).unwrap());
+        let press =
+            |app: &mut crate::app::App, code| app.key(KeyEvent::new(code, KeyModifiers::NONE));
+        app.select(0, false);
+        press(&mut app, KeyCode::Char('c'));
+        app.paste("Original 🙂");
+        press(&mut app, KeyCode::Enter);
+        app.save();
+        let original = crate::review::History::load(&app.project).unwrap().comments[0].clone();
+        press(&mut app, KeyCode::Char('a'));
+        app.save();
+        assert!(app.review.approved);
+        press(&mut app, KeyCode::Char('e'));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.comment.as_ref().unwrap().text, "Original 🙂");
+        press(&mut app, KeyCode::Home);
+        for _ in "Original 🙂".chars() {
+            press(&mut app, KeyCode::Delete);
+        }
+        app.paste("Updated 🙂\nWith detail");
+        press(&mut app, KeyCode::Enter);
+        assert!(!app.review.approved);
+        assert_eq!(app.review.notes[0].comments.len(), 1);
+        app.save();
+        assert!(!app.dirty);
+        let history = crate::review::History::load(&app.project).unwrap();
+        let mut expected = serde_json::to_value(original).unwrap();
+        expected["body"] = "Updated 🙂\nWith detail".into();
+        assert_eq!(history.comments.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&history.comments[0]).unwrap(),
+            expected
+        );
+        app.save();
+        assert_eq!(
+            crate::review::History::load(&app.project)
+                .unwrap()
+                .comments
+                .len(),
+            1
+        );
+        let reopened = crate::app::App::new(Project::load(&fixture.path()).unwrap());
+        assert!(reopened.review.notes[0].comments[0].contains("Updated 🙂"));
+    }
+
+    #[test]
+    fn overview_comment_selection_supports_cancel_and_unsaved_edits() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let fixture = Fixture::new();
+        let mut app = crate::app::App::new(Project::load(&fixture.path()).unwrap());
+        let press =
+            |app: &mut crate::app::App, code| app.key(KeyEvent::new(code, KeyModifiers::NONE));
+        for text in ["First", "Second"] {
+            press(&mut app, KeyCode::Char('c'));
+            app.paste(text);
+            press(&mut app, KeyCode::Enter);
+        }
+        press(&mut app, KeyCode::Char('e'));
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.comment.as_ref().unwrap().text, "Second");
+        app.paste(" canceled");
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.review.overview_comments[1], "Second");
+        press(&mut app, KeyCode::Char('e'));
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        app.paste(" updated");
+        press(&mut app, KeyCode::Enter);
+        app.save();
+        assert!(!app.dirty);
+        let history = crate::review::History::load(&app.project).unwrap();
+        assert_eq!(history.comments.len(), 2);
+        assert_eq!(history.comments[1].body, "Second updated");
+        // Saved overview comments also remain editable on reopen.
+        let mut app = crate::app::App::new(Project::load(&fixture.path()).unwrap());
+        press(&mut app, KeyCode::Char('e'));
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        app.paste(" again");
+        press(&mut app, KeyCode::Enter);
+        app.save();
+        assert!(!app.dirty);
+        assert_eq!(
+            crate::review::History::load(&app.project).unwrap().comments[1].body,
+            "Second updated again"
+        );
+    }
+
+    #[test]
+    fn comment_edits_reject_other_authors_and_concurrent_writes() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let fixture = Fixture::new();
+        let project = Project::load(&fixture.path()).unwrap();
+        crate::review::transaction(&project, None, |history| {
+            let round = history.ensure_round(&project)?;
+            for (author, body) in [("human", "Original"), ("other", "Read only")] {
+                history.add_comment(
+                    &project,
+                    &round,
+                    author,
+                    crate::review::Finding {
+                        target: crate::review::Target::Overview,
+                        severity: None,
+                        body: body.into(),
+                    },
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        let mut app = crate::app::App::new(Project::load(&fixture.path()).unwrap());
+        let press =
+            |app: &mut crate::app::App, code| app.key(KeyEvent::new(code, KeyModifiers::NONE));
+        press(&mut app, KeyCode::Char('e'));
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.comment.is_none());
+        assert!(!app.dirty);
+        press(&mut app, KeyCode::Char('e'));
+        press(&mut app, KeyCode::Enter);
+        app.paste(" local");
+        press(&mut app, KeyCode::Enter);
+        crate::review::transaction(&project, None, |history| {
+            history.comments[0].body = "External update".into();
+            Ok(())
+        })
+        .unwrap();
+        app.save();
+        assert!(app.dirty);
+        assert!(app.review.overview_comments[0].contains("Original local"));
+        assert_eq!(
+            crate::review::History::load(&project).unwrap().comments[0].body,
+            "External update"
+        );
+    }
+
+    #[test]
+    fn compact_new_snapshots_preserve_existing_historical_context() {
+        let fixture = Fixture::new();
+        let project = Project::load(&fixture.path()).unwrap();
+        project.save_review(&project.read_review().0).unwrap();
+        let mut history = crate::review::History::load(&project).unwrap();
+        history.rounds[0].context["proposal"] = serde_json::json!({"legacy_export":"keep exactly"});
+        history.rounds[0].context["files"][0]["source"] = serde_json::json!(["legacy line array"]);
+        let old = history.rounds[0].context.clone();
+        fs::write(&project.state_path, serde_json::to_vec(&history).unwrap()).unwrap();
+        fs::write(
+            fixture.0.join("code.ts"),
+            "function submit() {}\n// new round\n",
+        )
+        .unwrap();
+        let changed = Project::load(&fixture.path()).unwrap();
+        changed.save_review(&changed.read_review().0).unwrap();
+        let history = crate::review::History::load(&changed).unwrap();
+        assert_eq!(history.rounds.len(), 2);
+        assert_eq!(history.rounds[0].context, old);
+        assert!(history.rounds[1].context.get("proposal").is_none());
+        assert_eq!(
+            history.rounds[1].context["files"][0]["content"],
+            "function submit() {}\n// new round\n"
+        );
     }
 
     #[cfg(unix)]

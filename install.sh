@@ -20,12 +20,6 @@ while [ "$#" -gt 0 ]; do
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
-local_toolchain="$project_dir/../.toolchain"
-if [ -x "$local_toolchain/cargo/bin/cargo" ]; then
-    export CARGO_HOME="$local_toolchain/cargo"
-    export RUSTUP_HOME="$local_toolchain/rustup"
-    export PATH="$CARGO_HOME/bin:$PATH"
-fi
 command -v cargo >/dev/null 2>&1 || { echo 'Rust is required to build. Install it from https://rustup.rs and retry.' >&2; exit 1; }
 # Pin the target directory so the copied executable is always the one just built.
 cargo build --quiet --locked --release --manifest-path "$project_dir/Cargo.toml" --target-dir "$project_dir/target"

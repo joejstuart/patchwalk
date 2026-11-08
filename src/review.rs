@@ -224,7 +224,7 @@ impl History {
             proposal_revision: project.proposal.revision,
             proposal_digest: project.signature.clone(),
             source_digest: project.source_signature.clone(),
-            context: context_snapshot(project)?,
+            context: context_snapshot(project),
             decisions: vec![],
             annotation_status: BTreeMap::new(),
         });
@@ -322,28 +322,28 @@ pub fn validate_target(project: &Project, target: &Target) -> Result<()> {
     }
 }
 
-pub fn context_snapshot(project: &Project) -> Result<Value> {
+fn context_snapshot(project: &Project) -> Value {
     let mut paths: Vec<_> = project.files.keys().chain(project.diffs.keys()).collect();
     paths.sort();
     paths.dedup();
-    let files: Vec<_> = paths.into_iter().map(|path| {
-        let annotations: Vec<_> = project.proposal.annotations.iter().filter(|a| &a.file == path).map(|a| &a.id).collect();
-        if let Some(diff) = project.diffs.get(path) {
-            json!({"path":path,"annotation_ids":annotations,"before":diff.before,"after":diff.after,
-                "lines":diff.lines.iter().map(|line| json!({"kind":match line.kind {
-                    crate::model::DiffKind::Context=>"context", crate::model::DiffKind::Added=>"added", crate::model::DiffKind::Removed=>"removed"},
-                    "before_line":line.before,"after_line":line.after,"text":line.text})).collect::<Vec<_>>()})
-        } else { json!({"path":path,"annotation_ids":annotations,"source":project.raw_files.get(path).map(|raw| raw.lines().map(str::to_owned).collect::<Vec<_>>()).unwrap_or_else(|| project.files[path].clone()),"content":project.raw_files.get(path)}) }
-    }).collect();
-    Ok(
-        json!({"proposal_document":project.wire_proposal,"working_tree_modes":project.file_modes,"proposal":{"id":project.proposal.id,"revision":project.proposal.revision,"title":project.proposal.title,
-        "request":project.proposal.request,"goal":project.proposal.request,"approach":project.proposal.summary,"architecture":project.proposal.architecture,
-        "questions":project.proposal.questions,"annotations":project.proposal.annotations.iter().map(|a| json!({
-            "id":a.id,"path":a.file,"before_line":a.line,"before_end_line":a.end_line,"operation":a.kind,
-            "title":a.title,"intent":a.intent,"rationale":a.why,"alternatives":a.alternative})).collect::<Vec<_>>()},
-        "snapshot":{"base_commit":project.proposal.base_commit,"proposal_digest":project.signature,"source_digest":project.source_signature},
-        "files":files}),
-    )
+    let files: Vec<_> = paths
+        .into_iter()
+        .map(|path| {
+            if let Some(diff) = project.diffs.get(path) {
+                json!({"path":path,"before":diff.before,"after":diff.after})
+            } else {
+                // Planned new files have no source yet; preserve absence, not display text.
+                json!({"path":path,"content":project.raw_files.get(path)})
+            }
+        })
+        .collect();
+    json!({
+        "proposal_document":project.wire_proposal,
+        "working_tree_modes":project.file_modes,
+        "snapshot":{"base_commit":project.proposal.base_commit,
+            "proposal_digest":project.signature,"source_digest":project.source_signature},
+        "files":files
+    })
 }
 
 struct Lock(std::path::PathBuf);
@@ -429,6 +429,11 @@ pub fn project_review(project: &Project) -> Result<(Review, String)> {
     let history = History::load(project)?;
     let mut review = Review::new(project);
     review.generation = history.generation;
+    review.comment_sources = history
+        .comments
+        .iter()
+        .map(|comment| (display_comment(comment), comment.clone()))
+        .collect();
     review.stale = !history.rounds.is_empty() && history.current(project).is_none();
     review.approved = history.current(project).is_some_and(|round| {
         round
@@ -501,7 +506,7 @@ pub fn save_projection(project: &Project, review: &Review) -> Result<()> {
                 .get(index)
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
-            if !note.comments.starts_with(original) {
+            if !valid_comment_projection(review, original, &note.comments) {
                 return Err(
                     "Existing discussion cannot be edited through a stale projection".into(),
                 );
@@ -522,10 +527,11 @@ pub fn save_projection(project: &Project, review: &Review) -> Result<()> {
                 added = true;
             }
         }
-        if !review
-            .overview_comments
-            .starts_with(&review.original_overview_comments)
-        {
+        if !valid_comment_projection(
+            review,
+            &review.original_overview_comments,
+            &review.overview_comments,
+        ) {
             return Err(
                 "Existing overview discussion cannot be edited through a stale projection".into(),
             );
@@ -542,6 +548,29 @@ pub fn save_projection(project: &Project, review: &Review) -> Result<()> {
                 },
             )?;
             added = true;
+        }
+        for (id, body) in &review.comment_edits {
+            nonblank(body)?;
+            let original = review
+                .comment_sources
+                .values()
+                .find(|c| &c.id == id)
+                .ok_or("Unknown comment edit")?;
+            if original.author != "human" {
+                return Err("Only your own comments can be edited".into());
+            }
+            let comment = history
+                .comments
+                .iter_mut()
+                .find(|c| &c.id == id)
+                .ok_or("Comment no longer exists")?;
+            if comment.author != "human" || comment.body != original.body {
+                return Err("Comment changed in another viewer; reload before editing".into());
+            }
+            if comment.body != *body {
+                comment.body = body.clone();
+                added = true;
+            }
         }
         let current = history.rounds.last_mut().unwrap();
         current.annotation_status = review
@@ -568,4 +597,22 @@ pub fn save_projection(project: &Project, review: &Review) -> Result<()> {
         }
         Ok(())
     })
+}
+
+fn valid_comment_projection(review: &Review, original: &[String], current: &[String]) -> bool {
+    current.len() >= original.len()
+        && original.iter().zip(current).all(|(old, new)| {
+            if old == new {
+                return true;
+            }
+            let Some(source) = review.comment_sources.get(old) else {
+                return false;
+            };
+            let Some(body) = review.comment_edits.get(&source.id) else {
+                return false;
+            };
+            let mut changed = source.clone();
+            changed.body = body.clone();
+            source.author == "human" && display_comment(&changed) == *new
+        })
 }

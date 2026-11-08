@@ -123,7 +123,7 @@ fn start() -> Result<()> {
     }
     let mut app = App::new(project);
     if demo.is_some() {
-        app.message = "Demo · explore with Enter, w, c and ? · demo feedback is temporary".into();
+        app.notify("Demo · explore with Enter, w, c and ? · demo feedback is temporary".into());
     }
     ratatui::run(|terminal| -> io::Result<()> {
         crossterm::execute!(io::stdout(), EnableBracketedPaste)?;
