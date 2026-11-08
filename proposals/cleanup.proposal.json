@@ -1,0 +1,177 @@
+{
+  "format": "proposal-nav",
+  "version": 1,
+  "id": "patchwalk-cleanup",
+  "revision": 1,
+  "title": "Patchwalk cleanup review: obsolete hints, duplicate snapshots, and trial scaffolding",
+  "request": "Review the current code for cleanup that is no longer relevant, and provide a review in Patchwalk before changing source.",
+  "base_commit": "48c4b1851ea6588ab4fc4ed05858cb8962c8c2d2",
+  "overview": {
+    "summary": "Four scoped cleanup opportunities. First fix obsolete status-message checks that currently suppress useful navigation hints. Then reduce redundant representations in newly saved history, remove or explicitly configure the old workspace-specific toolchain fallback, and consider archiving unused miniLLM trial evidence. This is a plan, not implemented changes; the checkout remains clean.",
+    "architecture": "The viewer renders App state, while review.rs produces status and persists immutable review-round provenance. Presentation should not infer notification state from obsolete persistence strings. History should retain exact canonical inputs and preserve old rounds without repeatedly storing derived export formats. Source launch/install scripts should express supported toolchain requirements without assuming a particular scratch directory. Bundled demo/examples remain product assets; trial evidence is separate.",
+    "questions": [
+      "Do any external tools consume the redundant derived round.context fields? None were found in this repository; keep existing historical context untouched.",
+      "Should the miniLLM trial outputs be retained as a documented integration example or archived outside the product repository?"
+    ]
+  },
+  "annotations": [
+    {
+      "id": "status-hints",
+      "title": "Fix obsolete message checks that suppress navigation hints",
+      "operation": "replace",
+      "target": {
+        "path": "src/ui.rs",
+        "line": 975,
+        "end_line": 981,
+        "context": "    let transient = !app.message.starts_with(\"Read-only\") && app.message != \"Loaded saved review\";\n    let hint = if transient {\n        format!(\"  {}\", app.message)\n    } else if app.view.scroll + app.page_height < app.row_count {\n        \"  ↓ More below  ·  Tab + ↑↓ selects a change\".into()\n    } else {\n        \"  Enter opens a change  ·  Esc / o returns here\".into()"
+      },
+      "intent": "Replace the obsolete Read-only / Loaded saved review string checks in both overview and code panes with a shared way to distinguish normal review status from actionable notifications. Add focused rendering coverage for fresh and reopened reviews.",
+      "rationale": "project_review now emits Review notes stay local and Loaded shared review. Both current UI checks classify these normal statuses as transient, so overview navigation/scroll hints and code location information are replaced indefinitely. A stale string comparison survives from the earlier persistence implementation.",
+      "alternatives": [
+        "Update the two string literals directly for a smaller fix, but that leaves two rendering sites coupled to exact wording."
+      ],
+      "related": [
+        {
+          "type": "code",
+          "label": "Same stale check in the code pane",
+          "target": {
+            "path": "src/ui.rs",
+            "line": 1130,
+            "end_line": 1135,
+            "context": "    let transient = !app.message.starts_with(\"Read-only\") && app.message != \"Loaded saved review\";\n    let info = if transient {\n        format!(\"  {}\", app.message)\n    } else {\n        location\n    };"
+          }
+        },
+        {
+          "type": "code",
+          "label": "Actual messages from the history layer",
+          "target": {
+            "path": "src/review.rs",
+            "line": 481,
+            "end_line": 491,
+            "context": "    review.original_overview_comments = review.overview_comments.clone();\n    Ok((\n        review,\n        if history.rounds.is_empty() {\n            \"Review notes stay local\".into()\n        } else if history.current(project).is_none() {\n            \"Code or proposal changed since last review · comments preserved · previous approvals stale\".into()\n        } else {\n            \"Loaded shared review\".into()\n        },\n    ))"
+          }
+        }
+      ]
+    },
+    {
+      "id": "compact-snapshots",
+      "title": "Stop generating redundant context-export representations",
+      "operation": "replace",
+      "target": {
+        "path": "src/review.rs",
+        "line": 325,
+        "end_line": 346,
+        "context": "pub fn context_snapshot(project: &Project) -> Result<Value> {\n    let mut paths: Vec<_> = project.files.keys().chain(project.diffs.keys()).collect();\n    paths.sort();\n    paths.dedup();\n    let files: Vec<_> = paths.into_iter().map(|path| {\n        let annotations: Vec<_> = project.proposal.annotations.iter().filter(|a| &a.file == path).map(|a| &a.id).collect();\n        if let Some(diff) = project.diffs.get(path) {\n            json!({\"path\":path,\"annotation_ids\":annotations,\"before\":diff.before,\"after\":diff.after,\n                \"lines\":diff.lines.iter().map(|line| json!({\"kind\":match line.kind {\n                    crate::model::DiffKind::Context=>\"context\", crate::model::DiffKind::Added=>\"added\", crate::model::DiffKind::Removed=>\"removed\"},\n                    \"before_line\":line.before,\"after_line\":line.after,\"text\":line.text})).collect::<Vec<_>>()})\n        } else { json!({\"path\":path,\"annotation_ids\":annotations,\"source\":project.raw_files.get(path).map(|raw| raw.lines().map(str::to_owned).collect::<Vec<_>>()).unwrap_or_else(|| project.files[path].clone()),\"content\":project.raw_files.get(path)}) }\n    }).collect();\n    Ok(\n        json!({\"proposal_document\":project.wire_proposal,\"working_tree_modes\":project.file_modes,\"proposal\":{\"id\":project.proposal.id,\"revision\":project.proposal.revision,\"title\":project.proposal.title,\n        \"request\":project.proposal.request,\"goal\":project.proposal.request,\"approach\":project.proposal.summary,\"architecture\":project.proposal.architecture,\n        \"questions\":project.proposal.questions,\"annotations\":project.proposal.annotations.iter().map(|a| json!({\n            \"id\":a.id,\"path\":a.file,\"before_line\":a.line,\"before_end_line\":a.end_line,\"operation\":a.kind,\n            \"title\":a.title,\"intent\":a.intent,\"rationale\":a.why,\"alternatives\":a.alternative})).collect::<Vec<_>>()},\n        \"snapshot\":{\"base_commit\":project.proposal.base_commit,\"proposal_digest\":project.signature,\"source_digest\":project.source_signature},\n        \"files\":files}),\n    )"
+      },
+      "intent": "For newly created review rounds, retain the original proposal_document, exact per-file source or before/after text, working-tree modes and provenance. Stop also serializing reconstructed proposal summaries, duplicate source line arrays and rendered diff-line records. Preserve existing round context values untouched.",
+      "rationale": "No production consumer reads the derived context fields; rounds retain context as opaque JSON. The snapshot currently duplicates proposal_document with a reconstructed proposal object, source text with source arrays, and before/after strings with diff lines. These representations resemble the removed context-export workflow and inflate every saved round. Exact raw text and proposal JSON remain necessary for provenance.",
+      "alternatives": [
+        "Keep all representations for undocumented external readers; if that compatibility is desired, document it rather than treating context as private history."
+      ],
+      "related": [
+        {
+          "type": "code",
+          "label": "Round stores context as JSON",
+          "target": {
+            "path": "src/review.rs",
+            "line": 25,
+            "end_line": 34,
+            "context": "#[serde(deny_unknown_fields)]\npub struct Round {\n    pub id: String,\n    pub proposal_revision: u64,\n    pub proposal_digest: String,\n    pub source_digest: String,\n    pub context: Value,\n    pub decisions: Vec<Decision>,\n    pub annotation_status: BTreeMap<String, Status>,\n}"
+          }
+        },
+        {
+          "type": "code",
+          "label": "Round creation saves the snapshot",
+          "target": {
+            "path": "src/review.rs",
+            "line": 217,
+            "end_line": 230,
+            "context": "    pub fn ensure_round(&mut self, project: &Project) -> Result<String> {\n        if let Some(round) = self.current(project) {\n            return Ok(round.id.clone());\n        }\n        let id = format!(\"round-{}\", self.rounds.len() + 1);\n        self.rounds.push(Round {\n            id: id.clone(),\n            proposal_revision: project.proposal.revision,\n            proposal_digest: project.signature.clone(),\n            source_digest: project.source_signature.clone(),\n            context: context_snapshot(project)?,\n            decisions: vec![],\n            annotation_status: BTreeMap::new(),\n        });"
+          }
+        },
+        {
+          "type": "code",
+          "label": "Provenance regression test",
+          "target": {
+            "path": "src/model.rs",
+            "line": 1305,
+            "end_line": 1326,
+            "context": "    #[test]\n    fn raw_source_and_proposal_survive_human_history_snapshots() {\n        let fixture = Fixture::new();\n        fs::write(\n            fixture.0.join(\"code.ts\"),\n            \"function submit() {}\\r\\n\\t// evidence\\r\\n\",\n        )\n        .unwrap();\n        let project = Project::load(&fixture.path()).unwrap();\n        assert_eq!(\n            project.raw_files[\"code.ts\"],\n            \"function submit() {}\\r\\n\\t// evidence\\r\\n\"\n        );\n        let (mut review, _) = project.read_review();\n        review.approved = true;\n        project.save_review(&review).unwrap();\n        let history = crate::review::History::load(&project).unwrap();\n        assert_eq!(\n            history.rounds[0].context[\"proposal_document\"],\n            read_json(&fixture)\n        );\n        for contents in ["
+          }
+        }
+      ]
+    },
+    {
+      "id": "launcher-toolchain",
+      "title": "Remove the old scratch-workspace toolchain assumption",
+      "operation": "replace",
+      "target": {
+        "path": "run.sh",
+        "line": 4,
+        "end_line": 9,
+        "context": "local_toolchain=\"$project_dir/../.toolchain\"\nif [ -x \"$local_toolchain/cargo/bin/cargo\" ]; then\n    export CARGO_HOME=\"$local_toolchain/cargo\"\n    export RUSTUP_HOME=\"$local_toolchain/rustup\"\n    export PATH=\"$CARGO_HOME/bin:$PATH\"\nfi"
+      },
+      "intent": "Remove the hard-coded sibling ../.toolchain discovery from the launcher and installer, or replace it with a documented explicit override if still useful. Use one consistent toolchain selection rule and update the README. Keep run.sh as a convenient source launcher.",
+      "rationale": "The checkout now lives under ~/Developer/github/joejstuart/patchwalk, where the assumed sibling .toolchain directory does not exist. Cargo is also absent from this session PATH. This workspace-specific branch no longer serves the moved checkout and is duplicated in both scripts. The installed standalone binary works independently; removing this branch is cleanup, not a way to avoid the source-build Rust prerequisite.",
+      "alternatives": [
+        "Retain the fallback for the old compatibility-link path, but document it as a local development convenience rather than general installation behavior."
+      ],
+      "related": [
+        {
+          "type": "code",
+          "label": "Duplicate installer fallback",
+          "target": {
+            "path": "install.sh",
+            "line": 23,
+            "end_line": 29,
+            "context": "local_toolchain=\"$project_dir/../.toolchain\"\nif [ -x \"$local_toolchain/cargo/bin/cargo\" ]; then\n    export CARGO_HOME=\"$local_toolchain/cargo\"\n    export RUSTUP_HOME=\"$local_toolchain/rustup\"\n    export PATH=\"$CARGO_HOME/bin:$PATH\"\nfi\ncommand -v cargo >/dev/null 2>&1 || { echo 'Rust is required to build. Install it from https://rustup.rs and retry.' >&2; exit 1; }"
+          }
+        },
+        {
+          "type": "code",
+          "label": "Installation prerequisites and toolchain documentation",
+          "target": {
+            "path": "README.md",
+            "line": 40,
+            "end_line": 50,
+            "context": "To uninstall, remove the installed binary and `patchwalk` skill directory.\nThe launcher `./run.sh` also works without installation. Both scripts use this\nworkspace's isolated Rust toolchain when available, otherwise Cargo on PATH.\nFor a fresh machine, install Rust from [rustup.rs](https://rustup.rs) first.\nThe first build takes longer. macOS and Linux are the supported shell-install\npaths; no prebuilt release downloads are published by this checkout.\n\nWith Cargo on PATH, `cargo install --path . --locked` is another way to install\nthe binary, usually into `~/.cargo/bin`; install the skill separately if wanted.\nA built binary can also be copied to another machine of the same OS and CPU\narchitecture. The demo, schemas, and generation guides travel with it."
+          }
+        }
+      ]
+    },
+    {
+      "id": "archive-trial-artifacts",
+      "title": "Archive miniLLM experiment outputs outside the shipped tool",
+      "operation": "replace",
+      "target": {
+        "path": ".gitignore",
+        "line": 7,
+        "end_line": 8,
+        "context": "/proposals/minillm/implementation-stage/\n/proposals/minillm/implementation-before/"
+      },
+      "intent": "Review the proposals/minillm trial outputs for archival outside the product repository, then remove their two experiment-specific ignore entries if those directories are no longer maintained. Retain the generic demo and examples.",
+      "rationale": "Searches of source, tests, prompts, skill and documentation found no consumers of the miniLLM proposal/snapshot/verification artifacts. Their directory-specific ignore rules are remnants of an earlier trial. This is optional repository hygiene; it is not unused runtime code, and experiment evidence should be archived rather than silently discarded.",
+      "alternatives": [
+        "Keep one documented, portable example if the trial is useful as an integration case; remove or relocate machine-specific evidence files."
+      ],
+      "related": [
+        {
+          "type": "code",
+          "label": "Generic demo remains a maintained example",
+          "target": {
+            "path": "demo/proposal.json",
+            "line": 1,
+            "end_line": 8,
+            "context": "{\n  \"format\": \"proposal-nav\",\n  \"version\": 1,\n  \"id\": \"order-eligibility\",\n  \"revision\": 1,\n  \"title\": \"Check order eligibility before payment\",\n  \"request\": \"Reject orders from inactive customers or with no items before charging them, and return a useful reason.\",\n  \"overview\": {"
+          }
+        }
+      ]
+    }
+  ],
+  "metadata": {
+    "kind": "code-review-cleanup-plan",
+    "implementation_applied": false,
+    "review_scope": "Current checkout at 48c4b1851ea6588ab4fc4ed05858cb8962c8c2d2",
+    "validation": "Static source/call-site review plus Patchwalk schema, path and anchor validation. No source edits or fresh test run. The previous implementation turn passed 43 tests."
+  }
+}
