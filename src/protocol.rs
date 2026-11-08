@@ -8,9 +8,11 @@ use std::sync::OnceLock;
 pub const PROPOSAL_SCHEMA: &str = include_str!("../schemas/proposal-v1.schema.json");
 pub const IMPLEMENTED_SCHEMA: &str = include_str!("../schemas/proposal-v2.schema.json");
 pub const REVIEW_SCHEMA: &str = include_str!("../schemas/review-v1.schema.json");
+pub const REVIEW_HISTORY_SCHEMA: &str = include_str!("../schemas/review-v2.schema.json");
 static PROPOSAL_VALIDATOR: OnceLock<jsonschema::Validator> = OnceLock::new();
 static IMPLEMENTED_VALIDATOR: OnceLock<jsonschema::Validator> = OnceLock::new();
 static REVIEW_VALIDATOR: OnceLock<jsonschema::Validator> = OnceLock::new();
+static REVIEW_HISTORY_VALIDATOR: OnceLock<jsonschema::Validator> = OnceLock::new();
 
 fn validate(value: &Value, schema: &str, cache: &OnceLock<jsonschema::Validator>) -> Result<()> {
     let validator = cache.get_or_init(|| {
@@ -31,7 +33,11 @@ fn validate(value: &Value, schema: &str, cache: &OnceLock<jsonschema::Validator>
 }
 
 pub fn validate_review(value: &Value) -> Result<()> {
-    validate(value, REVIEW_SCHEMA, &REVIEW_VALIDATOR)
+    match value.get("version").and_then(Value::as_u64) {
+        Some(1) => validate(value, REVIEW_SCHEMA, &REVIEW_VALIDATOR),
+        Some(2) => validate(value, REVIEW_HISTORY_SCHEMA, &REVIEW_HISTORY_VALIDATOR),
+        _ => Err("Expected review version 1 or 2".into()),
+    }
 }
 
 pub fn parse_proposal(value: &Value) -> Result<Document> {

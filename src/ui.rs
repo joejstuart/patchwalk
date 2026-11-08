@@ -98,6 +98,7 @@ fn footer_bindings(app: &App, columns: usize) -> (Vec<Binding>, Vec<Binding>) {
             ("↑↓", "Select"),
             ("Tab", "Pane"),
             ("n/p", "Notes"),
+            ("c", "Comment"),
         ];
         let bottom = if columns < 4 {
             vec![("a", "Approve"), ("?", "Help"), ("q", "Quit")]
@@ -193,6 +194,8 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         ("● Draft", WARM)
     } else if app.dirty {
         ("● Unsaved", WARM)
+    } else if app.review.stale {
+        ("Review stale", WARM)
     } else if app.review.approved {
         ("✓ Approved", GREEN)
     } else {
@@ -317,7 +320,7 @@ fn annotation_rows(app: &App, index: usize, width: usize, rows: &mut Vec<Row>) {
         }
     }
     for comment in &app.review.notes[index].comments {
-        card_heading(rows, "YOUR REVIEW NOTE", width);
+        card_heading(rows, "REVIEW DISCUSSION", width);
         card_text(rows, comment, width, BRIGHT);
     }
 
@@ -582,7 +585,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         area,
     );
     if area.width < 65 || area.height < 16 {
-        frame.render_widget(Paragraph::new("Proposal Nav\n\nEnlarge the terminal to at least 65 columns × 16 rows.\nPress q to quit.")
+        frame.render_widget(Paragraph::new("Patchwalk\n\nEnlarge the terminal to at least 65 columns × 16 rows.\nPress q to quit.")
             .style(Style::default().fg(TEXT).bg(BG)).wrap(Wrap { trim: false }), area);
         return;
     }
@@ -638,8 +641,10 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         ])),
         columns[0],
     );
-    let state = if app.review.approved {
-        "✓ APPROVED LOCALLY"
+    let state = if app.review.stale {
+        "PREVIOUS REVIEW STALE"
+    } else if app.review.approved {
+        "✓ REVIEW ACCEPTED"
     } else if !app.project.diffs.is_empty() {
         "IMPLEMENTED CHANGE"
     } else {
@@ -786,9 +791,18 @@ fn draw_outline(frame: &mut Frame, app: &App, area: Rect, compact: bool) {
 
 fn draw_overview(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(Block::default().style(Style::default().bg(BG)), area);
+    let editor_height = app.comment.as_ref().map_or(0, |draft| {
+        let (lines, _) = comment_layout(
+            &draft.text,
+            draft.cursor,
+            area.width.saturating_sub(4) as usize,
+        );
+        (lines.len() + 2).clamp(3, (area.height as usize / 3).clamp(3, 7)) as u16
+    });
     let sections = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(1),
+        Constraint::Length(editor_height),
         Constraint::Length(1),
     ])
     .split(area);
@@ -834,6 +848,26 @@ fn draw_overview(frame: &mut Frame, app: &mut App, area: Rect) {
         lines.push(Line::from(strong(heading, WARM)));
         lines.extend(
             textwrap::wrap(text, width)
+                .into_iter()
+                .map(|s| simple(s.into_owned(), TEXT)),
+        );
+        lines.push(Line::from(""));
+    }
+    if app.review.stale {
+        lines.push(Line::from(strong(
+            "CODE OR PROPOSAL CHANGED · PREVIOUS APPROVALS STALE",
+            WARM,
+        )));
+        lines.push(simple(
+            "Previous discussion is preserved below and beside each change.",
+            MUTED,
+        ));
+        lines.push(Line::from(""));
+    }
+    for comment in &app.review.overview_comments {
+        lines.push(Line::from(strong("REVIEW DISCUSSION", WARM)));
+        lines.extend(
+            textwrap::wrap(comment, width)
                 .into_iter()
                 .map(|s| simple(s.into_owned(), TEXT)),
         );
@@ -946,7 +980,10 @@ fn draw_overview(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         "  Enter opens a change  ·  Esc / o returns here".into()
     };
-    frame.render_widget(Paragraph::new(simple(hint, MUTED)), sections[2]);
+    if app.comment.is_some() {
+        draw_comment(frame, app, sections[2]);
+    }
+    frame.render_widget(Paragraph::new(simple(hint, MUTED)), sections[3]);
 }
 
 fn draw_code(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -1142,11 +1179,11 @@ fn draw_comment(frame: &mut Frame, app: &App, area: Rect) {
     let note = &app.project.proposal.annotations[draft.annotation];
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .title(format!(
-            " Comment · {:02} {} ",
-            draft.annotation + 1,
-            note.title
-        ))
+        .title(if draft.overview {
+            " Comment · Overview ".into()
+        } else {
+            format!(" Comment · {:02} {} ", draft.annotation + 1, note.title)
+        })
         .border_style(Style::default().fg(if draft.editing { ACCENT } else { BORDER }))
         .style(Style::default().bg(BG).fg(TEXT));
     // Match the width used when calculating the dock height.
@@ -1278,7 +1315,7 @@ fn draw_popup(frame: &mut Frame, app: &mut App) {
                 ),
                 (
                     "EXPLORE",
-                    "Enter         Open an overview link\nEnter/w/Space Expand / collapse reasoning\nr             Follow related code\nEsc/Backspace Return to previous view, then overview\no             Return directly to overview",
+                    "Enter         Open an overview link\nEnter/w/Space Expand / collapse reasoning\nr             Follow related code\nEsc/Backspace Return to previous view, then overview\no             Return directly to overview\nR             Reload proposal and source",
                 ),
                 (
                     "REVIEW",
@@ -1319,8 +1356,7 @@ mod tests {
     #[test]
     #[ignore]
     fn export_visual_previews() {
-        let output =
-            std::env::var("PROPOSAL_NAV_PREVIEW_DIR").expect("Set PROPOSAL_NAV_PREVIEW_DIR");
+        let output = std::env::var("PATCHWALK_PREVIEW_DIR").expect("Set PATCHWALK_PREVIEW_DIR");
         std::fs::create_dir_all(&output).unwrap();
         for (name, width, height, expanded, popup) in [
             ("comment", 130, 40, true, None),
@@ -1336,10 +1372,10 @@ mod tests {
             ("related", 110, 35, false, Some(Popup::Related(1))),
         ] {
             let project = if name == "implemented" {
-                let Ok(path) = std::env::var("PROPOSAL_NAV_PREVIEW_PROPOSAL") else {
+                let Ok(path) = std::env::var("PATCHWALK_PREVIEW_PROPOSAL") else {
                     continue;
                 };
-                let root = std::env::var("PROPOSAL_NAV_PREVIEW_REPO").ok();
+                let root = std::env::var("PATCHWALK_PREVIEW_REPO").ok();
                 Project::load_with_root(Path::new(&path), root.as_deref().map(Path::new)).unwrap()
             } else {
                 Project::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("demo/proposal.json"))
@@ -1355,7 +1391,7 @@ mod tests {
             if !name.starts_with("overview") {
                 app.select(
                     if name == "implemented" {
-                        std::env::var("PROPOSAL_NAV_PREVIEW_ANNOTATION")
+                        std::env::var("PATCHWALK_PREVIEW_ANNOTATION")
                             .ok()
                             .and_then(|n| n.parse().ok())
                             .unwrap_or(0)
@@ -1379,7 +1415,7 @@ mod tests {
             }
             let buffer = terminal.backend().buffer();
             // Preview the same native colors against a sample terminal palette.
-            let light = std::env::var("PROPOSAL_NAV_PREVIEW_THEME").as_deref() == Ok("light");
+            let light = std::env::var("PATCHWALK_PREVIEW_THEME").as_deref() == Ok("light");
             let rgb = |c: Color, background: bool| match c {
                 Color::Rgb(r, g, b) => vec![r, g, b],
                 Color::Reset if background && light => vec![253, 246, 227],

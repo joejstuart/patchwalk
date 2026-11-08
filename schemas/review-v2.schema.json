@@ -1,0 +1,280 @@
+{
+  "type": "object",
+  "properties": {
+    "format": {
+      "const": "proposal-nav-review"
+    },
+    "version": {
+      "const": 2
+    },
+    "proposal_id": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
+    },
+    "generation": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "rounds": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S"
+          },
+          "proposal_revision": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "proposal_digest": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$"
+          },
+          "source_digest": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$"
+          },
+          "context": {
+            "type": "object"
+          },
+          "decisions": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "author": {
+                  "type": "string",
+                  "minLength": 1,
+                  "pattern": "\\S"
+                },
+                "outcome": {
+                  "enum": [
+                    "pending",
+                    "accepted",
+                    "changes_requested"
+                  ]
+                }
+              },
+              "required": [
+                "author",
+                "outcome"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "annotation_status": {
+            "type": "object",
+            "additionalProperties": {
+              "enum": [
+                "pending",
+                "reviewed",
+                "flagged"
+              ]
+            }
+          }
+        },
+        "required": [
+          "id",
+          "proposal_revision",
+          "proposal_digest",
+          "source_digest",
+          "context",
+          "decisions",
+          "annotation_status"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "comments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S"
+          },
+          "round_id": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S"
+          },
+          "author": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S"
+          },
+          "target": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "const": "overview"
+                  }
+                },
+                "required": [
+                  "type"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "const": "annotation"
+                  },
+                  "annotation_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "pattern": "\\S"
+                  }
+                },
+                "required": [
+                  "type",
+                  "annotation_id"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "const": "code"
+                  },
+                  "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "pattern": "\\S"
+                  },
+                  "side": {
+                    "enum": [
+                      "before",
+                      "after"
+                    ]
+                  },
+                  "line": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "end_line": {
+                    "anyOf": [
+                      {
+                        "type": "integer",
+                        "minimum": 1
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "type",
+                  "path",
+                  "side",
+                  "line"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          },
+          "severity": {
+            "anyOf": [
+              {
+                "enum": [
+                  "info",
+                  "warning",
+                  "error"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "body": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S"
+          },
+          "replies": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "author": {
+                  "type": "string",
+                  "minLength": 1,
+                  "pattern": "\\S"
+                },
+                "body": {
+                  "type": "string",
+                  "minLength": 1,
+                  "pattern": "\\S"
+                }
+              },
+              "required": [
+                "author",
+                "body"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "resolved_by": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "\\S"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "resolved_in_round": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "round_id",
+          "author",
+          "target",
+          "severity",
+          "body",
+          "replies",
+          "resolved_by",
+          "resolved_in_round"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": [
+    "format",
+    "version",
+    "proposal_id",
+    "generation",
+    "rounds",
+    "comments"
+  ],
+  "additionalProperties": false,
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:proposal-nav:review:2",
+  "title": "Shared review history v2"
+}

@@ -74,5 +74,5 @@
   "additionalProperties": false,
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:proposal-nav:review:1",
-  "title": "Proposal Nav feedback v1"
+  "title": "Patchwalk feedback v1"
 }

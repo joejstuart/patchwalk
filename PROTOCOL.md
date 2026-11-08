@@ -1,6 +1,6 @@
-# Proposal Nav file protocol, version 1
+# Patchwalk file protocol, version 1
 
-Proposal Nav consumes a provider-neutral artifact. Any LLM, editor, script, or person
+Patchwalk consumes a provider-neutral artifact. Any LLM, editor, script, or person
 can produce it. No Codex session, API key, model name, agent SDK, or MCP server is
 required by the format. Integrations transport the same files; they do not define
 separate provider-specific proposal types.
@@ -13,6 +13,10 @@ The normative structural contracts are:
 The viewer embeds both schemas and validates offline. It additionally checks the
 semantic and filesystem rules below. Schema compliance alone does not establish
 that the proposed architecture is correct.
+
+Patchwalk retains the `proposal-nav` and `proposal-nav-review` wire identifiers
+and schema URNs for compatibility with existing artifacts and saved reviews.
+The product and executable are now named Patchwalk and `patchwalk`.
 
 ## Proposal document
 
@@ -120,9 +124,10 @@ virtual new-file preview.
 
 `base_commit` records provenance and is not itself checked against Git. Exact
 anchor context is checked on load. Review feedback also fingerprints every loaded
-source file, so changes outside an anchored range invalidate old review state on
-reopening. Files not referenced by the proposal are not fingerprinted. The viewer
-currently loads a snapshot; it does not watch for changes during a review.
+source file, so changes outside an anchored range make earlier approvals stale.
+For planned proposals, files not referenced by the proposal are not fingerprinted.
+Git review additionally covers all changed text files. The viewer periodically
+checks for changed source and feedback; reopen to load a changed source snapshot.
 
 ## Related links
 
@@ -154,41 +159,20 @@ Forward links are allowed, but all IDs must exist. Evidence ranges are validated
 following a link opens its first line. Self-links and cycles are allowed because
 these are navigational references, not execution dependencies.
 
-## Review feedback
+## Shared review feedback
 
-The viewer owns feedback. Opening `feature.proposal.json` writes feedback to
-`feature.proposal.review.json` when the reviewer saves; it never rewrites the proposal.
-Feedback contains:
+The terminal stores `<proposal-stem>.review.json`, version 2, using
+[review-v2.schema.json](schemas/review-v2.schema.json). This is local human review
+history, not an agent interface. Comments retain stable IDs and original targets;
+rounds retain proposal/source snapshots and human approval metadata. Old comments
+and decisions remain readable for compatibility. Only the human decision for the
+current snapshot controls approval; historical reviewer decisions and error
+findings do not block it. New comments and annotation status changes clear human
+approval. Source or proposal changes make previous approval stale.
 
-```text
-format: "proposal-nav-review"
-version: 1
-proposal_id: the proposal's ID
-proposal_revision: the reviewed revision
-proposal_digest: "sha256:" plus 64 lowercase hex characters
-source_digest: "sha256:" plus 64 lowercase hex characters
-approved: true or false
-annotations: [{ id, status: "pending" | "reviewed" | "flagged", comments: [...] }]
-```
-
-Feedback must have exactly one entry per annotation ID, with no duplicate IDs.
-Its array order is irrelevant; the viewer resolves it by ID. Comments are nonblank
-strings. Approval applies to the entire recorded snapshot. Flagging, changing a
-review status, or adding a comment clears a previous approval. Approval is metadata
-and never runs an agent or changes source files.
-
-The viewer computes the digests; an LLM must not invent or recompute them.
-`proposal_digest` is SHA-256 of compact JSON with recursively sorted object keys,
-preserving array order. It is not an RFC 8785 interchange commitment: consumers
-should treat the viewer-generated value as opaque. Formatting/key-order changes
-alone preserve feedback. The source digest covers the viewer's loaded raw lines
-and the set of virtual new-file paths, before tab expansion. It is also opaque.
-
-Changing IDs, revision, proposal content, or loaded source invalidates saved review
-state. Existing feedback is left on disk until a subsequent explicit save. Revisions
-do not automatically transfer approvals or comments; producers may use old comments
-as context, then request a fresh review. Never treat a boolean approval as permission
-for a different revision or different source snapshot.
+Writes use a lock, generation checks, and atomic replacement. Conflicting saves
+retain the local draft and fail instead of overwriting another viewer's changes.
+Legacy v1 history migrates on save; its original source cannot be reconstructed.
 
 ## Producer workflow
 
@@ -209,16 +193,16 @@ contract. Publishing proposals does not currently push messages into any chat ap
 
 ```sh
 # Bundled example and its original source excerpts
-./proposal_nav/run.sh --check
+./run.sh --check
 
 # A proposal stored separately from the repository
-./proposal_nav/run.sh /path/to/feature.proposal.json --repo /path/to/project --check
+./run.sh /path/to/feature.proposal.json --repo /path/to/project --check
 
 # Open it after successful validation
-./proposal_nav/run.sh /path/to/feature.proposal.json --repo /path/to/project
+./run.sh /path/to/feature.proposal.json --repo /path/to/project
 
 # New-file example, from the scratch_pad directory
-./proposal_nav/run.sh proposal_nav/examples/new-file.proposal.json --check
+./run.sh examples/new-file.proposal.json --check
 ```
 
 Validation exits nonzero for invalid JSON, unsupported versions, schema violations,
@@ -238,22 +222,23 @@ that hash, and add:
 
 No file snapshots are needed. The viewer reads original files from that commit
 using Git, reads the result from the working tree, and renders the diff for the
-annotated paths. Staging is irrelevant: both staged and unstaged edits appear.
+annotated paths. Snapshot tracking also includes other changed text files. Staging is irrelevant: both staged and unstaged edits appear.
 Untracked new files and deletions are supported. No Git commands alter the index,
 branches, commits, or working files. Git must be installed and `--repo` must name the
 repository root. A full hash is required rather than a moving reference like HEAD.
 
 Existing-code anchors and evidence refer to the base commit's lines. New-file
-annotations use `create_file` and a path only. Every annotation target must actually
-have changed. The artifact is scoped to annotated paths, not all repository changes;
-producers must annotate every file belonging to the change. Handling unrelated edits
-inside these paths is outside the clean-start workflow.
+annotations use `create_file` and a path only. Annotate the intended changes;
+Git review also includes unannotated changed files. Annotation anchors remain
+readable if a later revision restores their target file to the baseline. Handling
+unrelated existing changes is outside the clean-start workflow.
 
 The code pane shows before/after line numbers and colored additions/removals.
 Annotations and comments remain available. Later working-tree edits are reflected
 on reopening; feedback fingerprints the loaded result, so previous approvals do
-not silently apply to a different working tree. The viewer does not watch files
-while open. Keep the pinned base commit available until review is complete.
+not silently apply to a different working tree. The viewer periodically detects
+source changes and marks approval stale; reopen to reload code. Keep the pinned
+base commit available until review is complete.
 
 Use `schemas/proposal-v2.schema.json` and the provider-neutral workflow in
 `prompts/record-implemented-change.txt`. Version 1 remains supported for plans.
@@ -269,5 +254,30 @@ The earlier v2 snapshot representation is still accepted:
 This explicit snapshot mode is optional, not part of the clean-Git workflow. Values
 are complete UTF-8 file strings, with null representing absence. The viewer checks
 the checkout against captured after content and rejects drift. The Git and snapshot
-representations cannot be combined. Review feedback v1 supports both forms; its
-proposal and source digests bind feedback to the exact loaded result.
+representations cannot be combined. Shared review history supports both forms;
+each round binds feedback to its exact loaded result.
+
+## Snapshot fidelity and historical access
+
+Review fingerprints include exact source text, including tabs, CRLF versus LF,
+and the final newline. Anchor comparison still normalizes line endings. Updating
+from an older build can therefore make existing approval stale; start a fresh round.
+In Git mode, fingerprints also include working-tree file modes (regular versus
+executable on Unix, with absence recorded for deleted files). Mode-only changes
+invalidate approval even when text is unchanged. Working-tree symlinks and other
+nonregular source entries are rejected; symlink review is unsupported.
+
+Raw source is retained separately from terminal display text. Saved history
+preserves exact source and the original proposal JSON for provenance. No command
+exports context or accepts reviewer submissions; humans review through the TUI.
+
+## Generated implemented-review scaffolds
+
+`patchwalk prepare --output FILE --repo ROOT [--base REVISION]` creates a
+validated v2 Git-backed draft from the entire current diff. It emits base-side
+anchors and deterministic annotation IDs, with TODO explanations for the author.
+It does not introduce a new wire version or authorize code changes. Empty
+existing files in implemented proposals may use the virtual anchor line 1,
+end_line 1, context ""; planned-proposal source anchors remain real source lines.
+For existing proposals, edit and increment revision rather than overwriting them
+with a new scaffold. The command refuses existing proposals or adjacent feedback.

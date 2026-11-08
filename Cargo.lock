@@ -1233,6 +1233,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "patchwalk"
+version = "0.1.0"
+dependencies = [
+ "crossterm",
+ "jsonschema",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "sha2",
+ "similar",
+ "syntect",
+ "textwrap",
+]
+
+[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1392,21 +1407,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "proposal-nav"
-version = "0.1.0"
-dependencies = [
- "crossterm",
- "jsonschema",
- "ratatui",
- "serde",
- "serde_json",
- "sha2",
- "similar",
- "syntect",
- "textwrap",
 ]
 
 [[package]]

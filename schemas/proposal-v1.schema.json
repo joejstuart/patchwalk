@@ -90,7 +90,7 @@
   "additionalProperties": false,
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:proposal-nav:proposal:1",
-  "title": "Proposal Nav proposal v1",
+  "title": "Patchwalk proposal v1",
   "$defs": {
     "path": {
       "type": "string",

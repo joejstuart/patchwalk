@@ -26,6 +26,7 @@ pub enum Popup {
 }
 
 pub struct CommentDraft {
+    pub overview: bool,
     pub annotation: usize,
     pub text: String,
     pub cursor: usize, // UTF-8 byte boundary, independent of terminal cell width.
@@ -190,6 +191,7 @@ impl App {
     pub fn save(&mut self) {
         match self.project.save_review(&self.review) {
             Ok(()) => {
+                self.review = self.project.read_review().0;
                 self.dirty = false;
                 self.message = format!(
                     "Saved feedback to {} · Source unchanged",
@@ -201,6 +203,63 @@ impl App {
                 );
             }
             Err(e) => self.message = format!("Save failed: {e}"),
+        }
+    }
+
+    pub fn reload(&mut self) {
+        if self.dirty || self.comment.is_some() {
+            self.message =
+                "Reload paused · save feedback with s and finish or cancel your draft first".into();
+            return;
+        }
+        let project = match self.project.reload() {
+            Ok(project) => project,
+            Err(error) => {
+                self.message = format!("Reload failed · current view retained: {error}");
+                return;
+            }
+        };
+        let selected_id = &self.project.proposal.annotations[self.view.selected].id;
+        let selected = project
+            .proposal
+            .annotations
+            .iter()
+            .position(|note| &note.id == selected_id);
+        let mut fresh = Self::new(project);
+        if let Some(index) = selected {
+            fresh.select(index, false);
+            fresh.view.expanded = self.view.expanded;
+            fresh.view.overview = self.view.overview;
+            fresh.view.focus = self.view.focus;
+            fresh.history.clear();
+        }
+        fresh.message = format!("Reloaded proposal and source · {}", fresh.message);
+        *self = fresh;
+    }
+
+    /// Import feedback from another viewer while idle, without replacing an unsaved human draft.
+    pub fn refresh_review(&mut self) {
+        if self.project.assert_current().is_err() {
+            self.review.stale = true;
+            self.review.approved = false;
+            self.message =
+                "Code or proposal changed · previous approvals stale · R reloads code".into();
+            return;
+        }
+        let (fresh, message) = self.project.read_review();
+        if fresh.generation != self.review.generation
+            || fresh.stale != self.review.stale
+            || fresh.load_failed
+        {
+            if self.dirty || self.comment.is_some() {
+                self.review.approved = false;
+                self.message =
+                    "Shared review changed · local draft retained · save will check for conflicts"
+                        .into();
+            } else {
+                self.review = fresh;
+                self.message = message;
+            }
         }
     }
 
@@ -333,10 +392,12 @@ impl App {
                     desired
                 };
                 self.review.approved = false;
+                self.review.approval_changed = true;
                 self.dirty = true;
             }
-            KeyCode::Char('c') if !self.view.overview => {
+            KeyCode::Char('c') => {
                 self.comment = Some(CommentDraft {
+                    overview: self.view.overview,
                     annotation: self.view.selected,
                     text: String::new(),
                     cursor: 0,
@@ -348,11 +409,13 @@ impl App {
             }
             KeyCode::Char('a') => {
                 self.review.approved = !self.review.approved;
+                self.review.approval_changed = true;
                 self.dirty = true;
                 self.message =
                     "Approval is local review metadata; no implementation is triggered".into();
             }
             KeyCode::Char('s') => self.save(),
+            KeyCode::Char('R') => self.reload(),
             KeyCode::Char('?') => {
                 self.popup_scroll = 0;
                 self.popup = Some(Popup::Help);
@@ -385,10 +448,17 @@ impl App {
                         return;
                     }
                     let draft = self.comment.take().unwrap();
-                    self.review.notes[draft.annotation]
-                        .comments
-                        .push(draft.text.trim().to_owned());
+                    if draft.overview {
+                        self.review
+                            .overview_comments
+                            .push(draft.text.trim().to_owned());
+                    } else {
+                        self.review.notes[draft.annotation]
+                            .comments
+                            .push(draft.text.trim().to_owned());
+                    }
                     self.review.approved = false;
+                    self.review.approval_changed = true;
                     self.dirty = true;
                     self.view.focus = draft.previous_focus;
                     self.message = "Comment added · s saves feedback".into();
@@ -506,6 +576,61 @@ mod tests {
     }
 
     #[test]
+    fn reload_tracks_annotation_ids_and_retains_view_on_invalid_proposal() {
+        let mut app = app();
+        let path =
+            std::env::temp_dir().join(format!("patchwalk-reload-{}.json", std::process::id()));
+        let mut proposal = app.project.wire_proposal.clone();
+        std::fs::write(&path, serde_json::to_vec(&proposal).unwrap()).unwrap();
+        app = App::new(
+            Project::load_with_root(
+                &path,
+                Some(&Path::new(env!("CARGO_MANIFEST_DIR")).join("demo")),
+            )
+            .unwrap(),
+        );
+        app.select(1, false);
+        let selected_id = app.project.proposal.annotations[1].id.clone();
+        app.view.expanded = true;
+        app.follow(1);
+        proposal["annotations"].as_array_mut().unwrap().swap(0, 1);
+        proposal["revision"] = 2.into();
+        std::fs::write(&path, serde_json::to_vec(&proposal).unwrap()).unwrap();
+        app.key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT));
+        assert_eq!(app.project.proposal.revision, 2);
+        assert_eq!(app.view.selected, 0);
+        assert_eq!(app.project.proposal.annotations[0].id, selected_id);
+        assert!(!app.view.evidence);
+        assert!(app.view.expanded);
+        assert!(app.history.is_empty());
+
+        std::fs::write(&path, "invalid JSON").unwrap();
+        app.reload();
+        assert!(app.message.starts_with("Reload failed"));
+        assert_eq!(app.project.proposal.revision, 2);
+        assert_eq!(app.view.selected, 0);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn reload_protects_unsaved_feedback_and_comment_drafts() {
+        let mut app = app();
+        app.select(1, false);
+        app.key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        app.reload();
+        assert!(app.dirty);
+        assert_eq!(app.review.notes[1].status, Status::Flagged);
+        assert!(app.message.starts_with("Reload paused"));
+
+        app.dirty = false;
+        app.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        app.paste("Keep this draft");
+        app.reload();
+        assert_eq!(app.comment.as_ref().unwrap().text, "Keep this draft");
+        assert!(app.message.starts_with("Reload paused"));
+    }
+
+    #[test]
     fn evidence_back_restores_scroll_focus_and_expansion() {
         let mut app = app();
         app.select(1, false);
@@ -599,7 +724,7 @@ mod tests {
     fn annotation_review_commands_do_not_affect_hidden_notes_on_overview() {
         let mut app = app();
         let initial = app.review.notes[0].status;
-        for command in ['v', 'f', 'c', 'r', 'w'] {
+        for command in ['v', 'f', 'r', 'w'] {
             app.key(KeyEvent::new(KeyCode::Char(command), KeyModifiers::NONE));
         }
         assert!(app.view.overview);

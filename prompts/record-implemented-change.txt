@@ -1,11 +1,23 @@
-Record an implemented change for Proposal Nav version 2 using Git. Assume the
+Record an implemented change for Patchwalk version 2 using Git. Assume the
 repository is clean before work begins. No file snapshot capture is required.
 
 Before implementing, record the full commit hash from git rev-parse HEAD. Work only
-within the user-authorized scope. Implement and test the change, then write a new
-proposal-nav artifact with version 2, base_commit set to that hash, stable annotation
-IDs, a higher revision, and implementation: {"source":"git"}. Do not embed before
-or after file strings. All changed source files must be represented by annotations.
+within the user-authorized scope. Implement and test the change, then scaffold a new review with:
+  patchwalk prepare --repo REPOSITORY --base COMMIT --output OUTPUT.json
+Use the recorded commit, not a newly guessed baseline. The command covers the
+whole diff from that commit, including any earlier edits. It does not infer task
+boundaries and refuses to overwrite existing proposals or adjacent feedback.
+For a revision, edit the existing artifact and increment revision instead.
+
+The generated Patchwalk artifact uses version 2, the recorded base_commit,
+stable annotation IDs, revision 1, and implementation: {"source":"git"}.
+Preserve IDs and increment revision when editing an existing proposal.
+Do not embed before or after file strings. All changed source files must be represented by annotations.
+The generated annotations already have IDs, operations, anchors and nearby links.
+Replace TODO explanations and titles with grounded intent, placement rationale,
+alternatives and actual validation results. Complete the overview and request,
+remove scaffold-only questions, and mark metadata.patchwalk_prepare.status ready.
+Do not hand off a mechanically generated draft as a completed explanation.
 
 The viewer compares each annotated path in that commit with the current working
 tree, including staged edits, unstaged edits, untracked new files, and deletions.
@@ -16,6 +28,6 @@ for files absent in the base commit. Link new files via annotation IDs.
 Explain the actual changes, architectural placement, alternatives, and validation
 results. Never claim unrun tests passed. Preserve earlier proposals and feedback.
 Validate against schemas/proposal-v2.schema.json and run:
-  proposal-nav OUTPUT.json --repo REPOSITORY --check
+  patchwalk OUTPUT.json --repo REPOSITORY --check
 Publish the complete JSON artifact atomically. No snapshotting, clean/reset command,
 staging, commit, push, or deployment is implied by producing a review artifact.

@@ -11,6 +11,18 @@ pub struct GitBaseline {
 }
 
 impl GitBaseline {
+    pub fn repository_root(directory: &Path) -> Result<PathBuf> {
+        let top = Self::command(directory, &["rev-parse", "--show-toplevel"])?;
+        if !top.status.success() {
+            return Err("Git review requires a Git repository".into());
+        }
+        Ok(PathBuf::from(String::from_utf8(top.stdout)?.trim()).canonicalize()?)
+    }
+
+    pub fn commit(&self) -> &str {
+        &self.commit
+    }
+
     fn command(root: &Path, args: &[&str]) -> Result<Output> {
         Ok(Command::new("git")
             .current_dir(root)
@@ -23,12 +35,7 @@ impl GitBaseline {
     }
 
     pub fn new(root: &Path, commit: &str) -> Result<Self> {
-        let top = Self::command(root, &["rev-parse", "--show-toplevel"])?;
-        if !top.status.success() {
-            return Err("Git review requires a Git repository".into());
-        }
-        let top = PathBuf::from(String::from_utf8(top.stdout)?.trim());
-        if top.canonicalize()? != root {
+        if Self::repository_root(root)? != root {
             return Err("--repo must select the Git repository root".into());
         }
         let expression = format!("{commit}^{{commit}}");
@@ -64,5 +71,33 @@ impl GitBaseline {
             return Err(format!("Cannot read Git source: {path}").into());
         }
         Ok(Some(String::from_utf8(contents.stdout)?))
+    }
+
+    pub fn changed_paths(&self) -> Result<std::collections::BTreeSet<String>> {
+        let mut paths = std::collections::BTreeSet::new();
+        for args in [
+            vec![
+                "diff",
+                "--no-ext-diff",
+                "--no-renames",
+                "--name-only",
+                "-z",
+                &self.commit,
+                "--",
+            ],
+            vec!["ls-files", "--others", "--exclude-standard", "-z"],
+        ] {
+            let output = Self::command(&self.root, &args)?;
+            if !output.status.success() {
+                return Err("Cannot list changed Git paths".into());
+            }
+            for name in String::from_utf8(output.stdout)?
+                .split('\0')
+                .filter(|s| !s.is_empty())
+            {
+                paths.insert(name.to_owned());
+            }
+        }
+        Ok(paths)
     }
 }

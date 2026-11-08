@@ -58,12 +58,17 @@ impl Related {
 
 pub struct Project {
     pub proposal: Proposal,
+    pub wire_proposal: serde_json::Value,
+    pub raw_files: std::collections::BTreeMap<String, String>,
+    pub file_modes: std::collections::BTreeMap<String, u32>,
     pub files: HashMap<String, Vec<String>>,
     pub new_files: HashSet<String>,
     pub diffs: HashMap<String, FileDiff>,
     pub state_path: PathBuf,
-    signature: String,
-    source_signature: String,
+    pub(crate) signature: String,
+    pub(crate) source_signature: String,
+    proposal_path: PathBuf,
+    repository_root: PathBuf,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -138,7 +143,7 @@ impl FileDiff {
     }
 }
 
-fn source_path(root: &Path, file: &str) -> Result<PathBuf> {
+pub(crate) fn source_path(root: &Path, file: &str) -> Result<PathBuf> {
     if file.contains('\\')
         || file.contains(':')
         || file
@@ -205,14 +210,28 @@ impl Project {
             None
         };
         let implementation_files = if let Some(base) = &git_base {
-            let paths: std::collections::BTreeSet<_> = document
+            let mut paths: std::collections::BTreeSet<_> = document
                 .annotations
                 .iter()
                 .map(|note| note.target.path.clone())
                 .collect();
+            paths.extend(base.changed_paths()?);
+            // Review artifacts are coordination data, not implementation changes.
+            let excluded = [
+                path.clone(),
+                path.with_extension("review.json"),
+                path.with_extension("review.json.lock"),
+                path.with_extension("review.json.tmp"),
+            ];
+            paths.retain(|name| !excluded.contains(&root.join(name)));
             let mut result = Vec::new();
             for name in paths {
                 let source = source_path(&root, &name)?;
+                if fs::symlink_metadata(&source).is_ok_and(|m| !m.is_file()) {
+                    return Err(
+                        format!("Git working source must be a regular text file: {name}").into(),
+                    );
+                }
                 let after = match fs::read_to_string(&source) {
                     Ok(text) => Some(text),
                     Err(e)
@@ -233,12 +252,48 @@ impl Project {
         } else {
             document.implementation.and_then(|i| i.files)
         };
+        let mut file_modes = std::collections::BTreeMap::new();
+        if git_base.is_some() {
+            for file in implementation_files.as_ref().into_iter().flatten() {
+                let source = source_path(&root, &file.path)?;
+                if let Ok(metadata) = fs::symlink_metadata(&source) {
+                    if !metadata.is_file() {
+                        return Err(format!(
+                            "Git working source must be a regular text file: {}",
+                            file.path
+                        )
+                        .into());
+                    }
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        file_modes.insert(
+                            file.path.clone(),
+                            if metadata.permissions().mode() & 0o111 != 0 {
+                                0o100755
+                            } else {
+                                0o100644
+                            },
+                        );
+                    }
+                    #[cfg(not(unix))]
+                    file_modes.insert(file.path.clone(), 0o100644);
+                } else {
+                    file_modes.insert(file.path.clone(), 0);
+                }
+            }
+        }
         let mut diffs = HashMap::new();
         if let Some(implementation_files) = implementation_files {
             for file in implementation_files {
                 let source = source_path(&root, &file.path)?;
                 if file.before == file.after {
-                    return Err(format!("Unchanged implementation file: {}", file.path).into());
+                    if git_base.is_some() && file.before.as_deref() != Some("") {
+                        continue;
+                    }
+                    if git_base.is_none() {
+                        return Err(format!("Unchanged implementation file: {}", file.path).into());
+                    }
                 }
                 let current = match fs::read_to_string(&source) {
                     Ok(text) => Some(text),
@@ -257,10 +312,11 @@ impl Project {
                     )
                     .into());
                 }
-                if !document
-                    .annotations
-                    .iter()
-                    .any(|note| note.target.path == file.path)
+                if git_base.is_none()
+                    && !document
+                        .annotations
+                        .iter()
+                        .any(|note| note.target.path == file.path)
                 {
                     return Err(format!("Implemented file has no annotation: {}", file.path).into());
                 }
@@ -270,9 +326,14 @@ impl Project {
                 }
             }
             for note in &document.annotations {
-                let diff = diffs
-                    .get(&note.target.path)
-                    .ok_or("Every implemented annotation must refer to a captured changed file")?;
+                let Some(diff) = diffs.get(&note.target.path) else {
+                    if git_base.is_some() {
+                        continue;
+                    }
+                    return Err(
+                        "Every implemented annotation must refer to a captured changed file".into(),
+                    );
+                };
                 if (note.operation == "create_file") != diff.before.is_none() {
                     return Err("create_file must refer to an absent before snapshot".into());
                 }
@@ -326,6 +387,19 @@ impl Project {
             let lines = &files[&target.path];
             let start = target.line.ok_or("Anchor line is required")?;
             let end = target.end_line.unwrap_or(start);
+            // Implemented changes to an empty base file have one virtual anchor.
+            // There is no real source line to quote for an insertion or deletion.
+            if lines.is_empty()
+                && start == 1
+                && end == 1
+                && target.context.as_deref() == Some("")
+                && (git_base.is_some()
+                    || diffs
+                        .get(&target.path)
+                        .is_some_and(|diff| diff.before.as_deref() == Some("")))
+            {
+                return Ok(());
+            }
             if start == 0 || end < start || end > lines.len() {
                 return Err(format!(
                     "Invalid anchor {}:{start}-{end} ({} lines)",
@@ -416,7 +490,20 @@ impl Project {
                 }
             })
             .collect();
+        let mut raw_files = std::collections::BTreeMap::new();
+        for name in files.keys().filter(|name| !new_files.contains(*name)) {
+            let raw = match &git_base {
+                Some(base) => base.read(name)?.ok_or("Missing base source")?,
+                None => match diffs.get(name) {
+                    Some(diff) => diff.before.clone().ok_or("Missing before source")?,
+                    None => fs::read_to_string(source_path(&root, name)?)?,
+                },
+            };
+            raw_files.insert(name.clone(), raw);
+        }
         let mut source_state = serde_json::json!({
+            "raw_files": raw_files,
+            "file_modes": file_modes,
             "files": files.iter().collect::<std::collections::BTreeMap<_, _>>(),
             "new_files": new_files.iter().collect::<std::collections::BTreeSet<_>>()
         });
@@ -430,6 +517,9 @@ impl Project {
         }
         let source_signature = protocol::digest(&source_state);
         Ok(Self {
+            wire_proposal: value,
+            raw_files,
+            file_modes,
             proposal: Proposal {
                 version: document.version,
                 id: document.id,
@@ -454,76 +544,46 @@ impl Project {
             new_files,
             diffs,
             state_path: path.with_extension("review.json"),
+            proposal_path: path,
+            repository_root: root,
             signature,
             source_signature,
         })
     }
 
-    pub fn read_review(&self) -> (Review, String) {
-        if !self.state_path.exists() {
-            return (
-                Review::new(self),
-                "Read-only source · Review notes stay local".into(),
+    pub fn reload(&self) -> Result<Self> {
+        Self::load_with_root(&self.proposal_path, Some(&self.repository_root))
+    }
+
+    pub fn assert_current(&self) -> Result<()> {
+        let current = self.reload()?;
+        if current.signature != self.signature || current.source_signature != self.source_signature
+        {
+            return Err(
+                "Code or proposal changed while reviewing; reload before writing feedback".into(),
             );
         }
-        let load = || -> Result<Review> {
-            let value = serde_json::from_str(&fs::read_to_string(&self.state_path)?)?;
-            protocol::validate_review(&value)?;
-            let mut review: Review = serde_json::from_value(value)?;
-            if review.proposal_id != self.proposal.id
-                || review.proposal_revision != self.proposal.revision
-                || review.proposal_digest != self.signature
-                || review.source_digest != self.source_signature
-            {
-                return Err(
-                    "Saved review belongs to a different proposal revision; ignored".into(),
-                );
+        Ok(())
+    }
+
+    pub fn read_review(&self) -> (Review, String) {
+        match crate::review::project_review(self) {
+            Ok(result) => result,
+            Err(error) => {
+                let mut review = Review::new(self);
+                review.load_failed = true;
+                (review, format!("Could not load review: {error}"))
             }
-            let mut by_id = HashMap::new();
-            for note in review.notes {
-                if by_id.insert(note.id.clone(), note).is_some() {
-                    return Err("Duplicate feedback annotation ID".into());
-                }
-            }
-            if by_id.len() != self.proposal.annotations.len() {
-                return Err("Feedback IDs do not match proposal".into());
-            }
-            review.notes = self
-                .proposal
-                .annotations
-                .iter()
-                .map(|note| {
-                    by_id
-                        .remove(&note.id)
-                        .ok_or("Feedback IDs do not match proposal")
-                })
-                .collect::<std::result::Result<_, _>>()?;
-            Ok(review)
-        };
-        match load() {
-            Ok(review) => (review, "Loaded saved review".into()),
-            Err(e) => (Review::new(self), format!("Could not load review: {e}")),
         }
     }
 
     pub fn save_review(&self, review: &Review) -> Result<()> {
-        let value = serde_json::to_value(review)?;
-        protocol::validate_review(&value)?;
-        let temporary = self.state_path.with_extension("json.tmp");
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)?;
-        use std::io::Write;
-        if let Err(error) = (|| -> std::io::Result<()> {
-            file.write_all(&serde_json::to_vec_pretty(&value)?)?;
-            file.sync_all()?;
-            fs::rename(&temporary, &self.state_path)
-        })() {
-            let _ = fs::remove_file(&temporary);
-            return Err(error.into());
+        if review.load_failed {
+            return Err(
+                "Review could not be loaded; refusing to overwrite existing feedback".into(),
+            );
         }
-        Ok(())
+        crate::review::save_projection(self, review)
     }
 }
 
@@ -547,17 +607,33 @@ pub struct ReviewNote {
 pub struct Review {
     format: String,
     version: u8,
-    proposal_id: String,
-    proposal_revision: u64,
-    proposal_digest: String,
-    source_digest: String,
+    pub(crate) proposal_id: String,
+    pub(crate) proposal_revision: u64,
+    pub(crate) proposal_digest: String,
+    pub(crate) source_digest: String,
     #[serde(rename = "annotations")]
     pub notes: Vec<ReviewNote>,
     pub approved: bool,
+    #[serde(skip)]
+    pub stale: bool,
+    #[serde(skip)]
+    pub(crate) original_approved: bool,
+    #[serde(skip)]
+    pub(crate) approval_changed: bool,
+    #[serde(skip)]
+    pub overview_comments: Vec<String>,
+    #[serde(skip)]
+    pub(crate) generation: u64,
+    #[serde(skip)]
+    pub(crate) original_comments: Vec<Vec<String>>,
+    #[serde(skip)]
+    pub(crate) original_overview_comments: Vec<String>,
+    #[serde(skip)]
+    pub(crate) load_failed: bool,
 }
 
 impl Review {
-    fn new(project: &Project) -> Self {
+    pub(crate) fn new(project: &Project) -> Self {
         Self {
             format: "proposal-nav-review".into(),
             version: 1,
@@ -575,6 +651,14 @@ impl Review {
                 })
                 .collect(),
             approved: false,
+            stale: false,
+            original_approved: false,
+            approval_changed: false,
+            overview_comments: vec![],
+            generation: 0,
+            original_comments: vec![],
+            original_overview_comments: vec![],
+            load_failed: false,
         }
     }
 }
@@ -660,7 +744,7 @@ mod tests {
         project.save_review(&review).unwrap();
         let (loaded, _) = project.read_review();
         assert_eq!(loaded.notes[0].status, Status::Flagged);
-        assert_eq!(loaded.notes[0].comments, review.notes[0].comments);
+        assert!(loaded.notes[0].comments[0].contains(&review.notes[0].comments[0]));
         assert_eq!(fs::read(fixture.path()).unwrap(), original);
         assert_eq!(
             fs::read_to_string(fixture.0.join("code.ts")).unwrap(),
@@ -681,7 +765,157 @@ mod tests {
         let changed = Project::load(&fixture.path()).unwrap();
         let (loaded, message) = changed.read_review();
         assert_eq!(loaded.notes[0].status, Status::Pending);
-        assert!(message.contains("different proposal"));
+        assert!(message.contains("previous approvals stale"));
+        assert!(!loaded.notes[0].comments.is_empty());
+    }
+
+    #[test]
+    fn terminal_save_preserves_feedback_and_rejects_concurrent_writers() {
+        let fixture = Fixture::new();
+        let project = Project::load(&fixture.path()).unwrap();
+        let (mut terminal, _) = project.read_review();
+        terminal.notes[0].comments.push("My unsaved note".into());
+        crate::review::transaction(&project, None, |history| {
+            let round = history.ensure_round(&project)?;
+            history.add_comment(
+                &project,
+                &round,
+                "reviewer",
+                crate::review::Finding {
+                    target: crate::review::Target::Overview,
+                    severity: None,
+                    body: "Architecture finding".into(),
+                },
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            project
+                .save_review(&terminal)
+                .unwrap_err()
+                .to_string()
+                .contains("another process")
+        );
+        assert_eq!(terminal.notes[0].comments, ["My unsaved note"]);
+        let (mut fresh, _) = project.read_review();
+        assert!(fresh.overview_comments[0].contains("reviewer"));
+        fresh.notes[0].comments.push("My saved note".into());
+        project.save_review(&fresh).unwrap();
+        let (again, _) = project.read_review();
+        project.save_review(&again).unwrap();
+        let history = crate::review::History::load(&project).unwrap();
+        assert_eq!(history.comments.len(), 2); // Saving again does not duplicate comments.
+        assert!(history.comments.iter().any(|c| c.author == "human"));
+        assert!(history.comments.iter().any(|c| c.author == "reviewer"));
+    }
+
+    #[test]
+    fn legacy_review_migrates_without_losing_stale_comments_or_approval_history() {
+        let fixture = Fixture::new();
+        let project = Project::load(&fixture.path()).unwrap();
+        let mut legacy = Review::new(&project);
+        legacy.notes[0].comments.push("Legacy feedback".into());
+        legacy.approved = true;
+        fs::write(&project.state_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        fs::write(
+            fixture.0.join("code.ts"),
+            "function submit() {}\n// revision\n",
+        )
+        .unwrap();
+        let changed = Project::load(&fixture.path()).unwrap();
+        let (review, _) = changed.read_review();
+        assert!(review.stale);
+        assert!(!review.approved);
+        assert!(review.notes[0].comments[0].contains("Legacy feedback"));
+        changed.save_review(&review).unwrap();
+        let history = crate::review::History::load(&changed).unwrap();
+        assert_eq!(history.rounds.len(), 2);
+        assert!(history.rounds[0].decisions[0].outcome == crate::review::Outcome::Accepted);
+        assert_eq!(history.comments.len(), 1);
+        assert_eq!(history.version, 2);
+    }
+
+    #[test]
+    fn save_rejects_code_changed_since_terminal_opened_and_corrupt_review() {
+        let fixture = Fixture::new();
+        let project = Project::load(&fixture.path()).unwrap();
+        let (review, _) = project.read_review();
+        fs::write(
+            fixture.0.join("code.ts"),
+            "function submit() {}\n// revision\n",
+        )
+        .unwrap();
+        assert!(
+            project
+                .save_review(&review)
+                .unwrap_err()
+                .to_string()
+                .contains("changed while reviewing")
+        );
+        assert!(!project.state_path.exists());
+        fs::write(&project.state_path, "broken json").unwrap();
+        let project = Project::load(&fixture.path()).unwrap();
+        let (review, message) = project.read_review();
+        assert!(message.contains("Could not load"));
+        assert!(project.save_review(&review).is_err());
+        assert_eq!(
+            fs::read_to_string(&project.state_path).unwrap(),
+            "broken json"
+        );
+    }
+
+    #[test]
+    fn terminal_overview_comments_share_history_and_external_reviews_refresh_safely() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let fixture = Fixture::new();
+        let project = Project::load(&fixture.path()).unwrap();
+        let mut app = crate::app::App::new(project);
+        app.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert!(app.comment.as_ref().unwrap().overview);
+        app.paste("Human architecture question");
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.save();
+        assert!(!app.dirty);
+        let history = crate::review::History::load(&app.project).unwrap();
+        assert!(matches!(
+            history.comments[0].target,
+            crate::review::Target::Overview
+        ));
+        crate::review::transaction(&app.project, None, |history| {
+            let round = history.ensure_round(&app.project)?;
+            history.decision(&round, "reviewer", crate::review::Outcome::Accepted)
+        })
+        .unwrap();
+        app.refresh_review();
+        assert!(!app.review.approved);
+        // Plain save preserves historical reviewer decisions.
+        app.save();
+        assert_eq!(
+            crate::review::History::load(&app.project).unwrap().rounds[0]
+                .decisions
+                .len(),
+            2
+        );
+        // Human comment created a pending decision; explicitly accept it to finish.
+        app.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        app.save();
+        assert!(app.review.approved);
+        app.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        app.save();
+        assert!(!app.review.approved);
+        app.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        app.save();
+        assert!(app.review.approved);
+        fs::write(
+            fixture.0.join("code.ts"),
+            "function submit() {}\n// revision\n",
+        )
+        .unwrap();
+        app.refresh_review();
+        assert!(app.review.stale);
+        assert!(!app.review.approved);
+        assert!(app.review.overview_comments[0].contains("Human architecture question"));
     }
 
     #[test]
@@ -818,7 +1052,7 @@ mod tests {
     }
 
     #[test]
-    fn feedback_uses_ids_and_is_invalidated_by_content_or_source_changes() {
+    fn feedback_uses_ids_and_preserves_comments_across_content_or_source_changes() {
         let fixture = Fixture::new();
         let mut value = read_json(&fixture);
         let mut second = value["annotations"][0].clone();
@@ -834,11 +1068,11 @@ mod tests {
         let mut feedback: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&project.state_path).unwrap()).unwrap();
         protocol::validate_review(&feedback).unwrap();
-        feedback["annotations"].as_array_mut().unwrap().reverse();
+        feedback["comments"].as_array_mut().unwrap().reverse();
         fs::write(&project.state_path, feedback.to_string()).unwrap();
         let (loaded, _) = project.read_review();
         assert_eq!(loaded.notes[0].id, "add-rule");
-        assert_eq!(loaded.notes[0].comments, ["Feedback for the first ID"]);
+        assert!(loaded.notes[0].comments[0].contains("Feedback for the first ID"));
         // A source change outside the anchor must still invalidate old approval.
         fs::write(
             fixture.0.join("code.ts"),
@@ -846,7 +1080,8 @@ mod tests {
         )
         .unwrap();
         let updated = Project::load(&fixture.path()).unwrap();
-        assert!(updated.read_review().0.notes[0].comments.is_empty());
+        assert!(!updated.read_review().0.notes[0].comments.is_empty());
+        assert!(updated.read_review().0.stale);
         // Content changes invalidate feedback even if a generator forgot to bump revision.
         value["title"] = "A different proposal".into();
         write_json(&fixture, &value);
@@ -857,7 +1092,8 @@ mod tests {
                 .0
                 .notes[0]
                 .comments
-                .is_empty()
+                .len()
+                == 1
         );
     }
     #[test]
@@ -1002,7 +1238,8 @@ mod tests {
                 .unwrap()
                 .contains("newer()")
         );
-        assert!(newer.read_review().0.notes[0].comments.is_empty());
+        assert_eq!(newer.read_review().0.notes[0].comments.len(), 1);
+        assert!(newer.read_review().0.stale);
     }
 
     #[test]
@@ -1029,6 +1266,100 @@ mod tests {
         );
         value["base_commit"] = serde_json::Value::Null;
         write_json(&fixture, &value);
+        assert!(Project::load(&fixture.path()).is_err());
+    }
+    #[test]
+    fn human_approval_ignores_legacy_reviewer_blocks() {
+        let fixture = Fixture::new();
+        let project = Project::load(&fixture.path()).unwrap();
+        crate::review::transaction(&project, None, |history| {
+            let round = history.ensure_round(&project)?;
+            history.decision(
+                &round,
+                "old-agent",
+                crate::review::Outcome::ChangesRequested,
+            )?;
+            history.add_comment(
+                &project,
+                &round,
+                "old-agent",
+                crate::review::Finding {
+                    target: crate::review::Target::Overview,
+                    severity: Some(crate::review::Severity::Error),
+                    body: "Historical finding".into(),
+                },
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let (mut review, _) = project.read_review();
+        assert!(!review.approved);
+        review.approved = true;
+        review.approval_changed = true;
+        project.save_review(&review).unwrap();
+        let (review, _) = project.read_review();
+        assert!(review.approved);
+        assert!(review.overview_comments[0].contains("Historical finding"));
+    }
+
+    #[test]
+    fn raw_source_and_proposal_survive_human_history_snapshots() {
+        let fixture = Fixture::new();
+        fs::write(
+            fixture.0.join("code.ts"),
+            "function submit() {}\r\n\t// evidence\r\n",
+        )
+        .unwrap();
+        let project = Project::load(&fixture.path()).unwrap();
+        assert_eq!(
+            project.raw_files["code.ts"],
+            "function submit() {}\r\n\t// evidence\r\n"
+        );
+        let (mut review, _) = project.read_review();
+        review.approved = true;
+        project.save_review(&review).unwrap();
+        let history = crate::review::History::load(&project).unwrap();
+        assert_eq!(
+            history.rounds[0].context["proposal_document"],
+            read_json(&fixture)
+        );
+        for contents in [
+            "function submit() {}\n\t// evidence\n",
+            "function submit() {}\r\n\t// evidence",
+        ] {
+            fs::write(fixture.0.join("code.ts"), contents).unwrap();
+            assert!(
+                Project::load(&fixture.path())
+                    .unwrap()
+                    .read_review()
+                    .0
+                    .stale
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_human_approval_detects_modes_and_rejects_symlink_substitution() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let fixture = Fixture::new();
+        let value = git_proposal(&fixture);
+        write_json(&fixture, &value);
+        let project = Project::load(&fixture.path()).unwrap();
+        let (mut review, _) = project.read_review();
+        review.approved = true;
+        project.save_review(&review).unwrap();
+        fs::set_permissions(fixture.0.join("code.ts"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            Project::load(&fixture.path())
+                .unwrap()
+                .read_review()
+                .0
+                .stale
+        );
+        fs::write(fixture.0.join("copy.ts"), "function submit() {}\n").unwrap();
+        fs::remove_file(fixture.0.join("code.ts")).unwrap();
+        symlink("copy.ts", fixture.0.join("code.ts")).unwrap();
         assert!(Project::load(&fixture.path()).is_err());
     }
 }

@@ -1,5 +1,5 @@
 [package]
-name = "proposal-nav"
+name = "patchwalk"
 version = "0.1.0"
 edition = "2024"
 description = "Explore a saved change proposal as annotations in existing code"

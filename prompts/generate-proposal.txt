@@ -1,4 +1,4 @@
-Create a provider-neutral Proposal Nav v1 proposal for the user's requested change.
+Create a provider-neutral Patchwalk v1 proposal for the user's requested change.
 
 Inputs supplied by the user or adapter:
 - The feature request or bug report.
@@ -38,7 +38,7 @@ assumptions or unknowns in overview.questions. Empty questions, alternatives, an
 related arrays are valid where there is genuinely nothing to record.
 
 Validate against the JSON Schema and, when the viewer is available, run:
-  proposal-nav OUTPUT.json --repo REPOSITORY --check
+  patchwalk OUTPUT.json --repo REPOSITORY --check
 If validation fails, correct the artifact. Publish a complete validated proposal
 using a temporary file and rename to the agreed final filename.
 
