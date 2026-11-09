@@ -240,6 +240,20 @@ not silently apply to a different working tree. The viewer periodically detects
 source changes and marks approval stale; reopen to reload code. Keep the pinned
 base commit available until review is complete.
 
+### Comparing two commits
+
+Set `base_commit` to the full hash of the before commit and record the full
+hash of the after commit in `implementation.head_commit`:
+
+```json
+{"implementation": {"source": "git", "head_commit": "13f362d8e0763c77da435c44cc078511579133f5"}}
+```
+
+The viewer reads both sides from Git. Anchors still refer to the base commit.
+Review feedback stays bound to the same commit pair across checkout changes.
+When `head_commit` is omitted, the viewer reads the after side from the working
+tree.
+
 Use `schemas/proposal-v2.schema.json` and the provider-neutral workflow in
 `prompts/record-implemented-change.txt`. Version 1 remains supported for plans.
 
@@ -275,8 +289,10 @@ exports context or accepts reviewer submissions; humans review through the TUI.
 
 ## Generated implemented-review scaffolds
 
-`patchwalk prepare --output FILE --repo ROOT [--base REVISION]` creates a
-validated v2 Git-backed draft from the entire current diff. It emits base-side
+`patchwalk prepare --output FILE --repo ROOT` creates a validated v2 Git-backed
+draft from the current diff against `HEAD` or `--base REVISION`. Supply
+`--base REVISION --head REVISION` or `--range BASE..HEAD` to draft a review of the
+net changes between two commits. It emits base-side
 anchors and deterministic annotation IDs, with TODO explanations for the author.
 It does not introduce a new wire version or authorize code changes. Empty
 existing files in implemented proposals may use the virtual anchor line 1,

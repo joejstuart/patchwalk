@@ -12,23 +12,27 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const HELP: &str = "Usage: patchwalk prepare --output FILE [--repo DIRECTORY] [--base REVISION]
+const HELP: &str = "Usage: patchwalk prepare --output FILE [--repo DIRECTORY]
+                         [--base REVISION [--head REVISION] | --range BASE..HEAD]
                          [--title TEXT] [--request TEXT]
 
 Generate a draft v2 proposal covering the complete diff against HEAD (or --base),
 including staged, unstaged, deleted, and nonignored untracked text files.
+With --base and --head, or --range BASE..HEAD, compare two commit trees.
+Both endpoints are required and pinned to full hashes. The working tree is ignored.
 --repo defaults to the current directory; subdirectories discover the Git root.
 Anchors and IDs are automatic. Fill in TODO explanations, then run --check.
 Existing proposals and review files are never overwritten. Binary files and
 symlinks are unsupported; an error leaves no proposal behind.
-This is the entire diff from the base, not just changes from this agent task.
 
-Example: patchwalk prepare --output /tmp/change.proposal.json --base HEAD";
+Example: patchwalk prepare --output /tmp/change.proposal.json --range HEAD~3..HEAD";
 
 pub fn run(mut args: impl Iterator<Item = String>) -> Result<()> {
     let mut output = None;
     let mut repository = std::env::current_dir()?;
-    let mut revision = "HEAD".to_owned();
+    let mut base_revision = None;
+    let mut head_revision = None;
+    let mut range = None;
     let mut title = "Draft change review".to_owned();
     let mut request = "TODO: Describe the original request.".to_owned();
     while let Some(arg) = args.next() {
@@ -37,7 +41,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<()> {
                 println!("{HELP}");
                 return Ok(());
             }
-            "--output" | "--repo" | "--base" | "--title" | "--request" => {
+            "--output" | "--repo" | "--base" | "--head" | "--range" | "--title" | "--request" => {
                 let value = args
                     .next()
                     .filter(|s| !s.is_empty() && !s.starts_with("--"))
@@ -45,7 +49,9 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<()> {
                 match arg.as_str() {
                     "--output" => output = Some(PathBuf::from(value)),
                     "--repo" => repository = PathBuf::from(value),
-                    "--base" => revision = value,
+                    "--base" => base_revision = Some(value),
+                    "--head" => head_revision = Some(value),
+                    "--range" => range = Some(value),
                     "--title" => title = value,
                     "--request" => request = value,
                     _ => unreachable!(),
@@ -60,6 +66,29 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<()> {
         }
     }
     let output = output.ok_or("prepare requires --output FILE. See patchwalk prepare --help")?;
+    let (base_revision, head_revision) = if let Some(range) = &range {
+        if base_revision.is_some() || head_revision.is_some() {
+            return Err("--range cannot be combined with --base or --head".into());
+        }
+        let (base, head) = range
+            .split_once("..")
+            .filter(|(base, head)| {
+                !base.is_empty()
+                    && !head.is_empty()
+                    && !head.starts_with('.')
+                    && !head.contains("..")
+            })
+            .ok_or("--range requires two revisions in BASE..HEAD form")?;
+        (base, Some(head))
+    } else {
+        if head_revision.is_some() && base_revision.is_none() {
+            return Err("--head requires --base".into());
+        }
+        (
+            base_revision.as_deref().unwrap_or("HEAD"),
+            head_revision.as_deref(),
+        )
+    };
     let root = GitBaseline::repository_root(&repository)?;
     let parent = output
         .parent()
@@ -86,23 +115,29 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<()> {
             .into());
         }
     }
-    let base = GitBaseline::new(&root, &revision)?;
+    let base = GitBaseline::new(&root, base_revision)?;
+    let head = head_revision
+        .map(|revision| base.head(revision))
+        .transpose()?;
     let mut annotations = Vec::new();
     let mut files = 0;
-    for name in base.changed_paths()? {
-        let path = crate::model::source_path(&root, &name)?;
-        if path == output {
-            continue;
-        }
+    for name in base.changed_paths(head.as_ref())? {
+        let after = if let Some(head) = &head {
+            crate::model::validate_source_path(&name)?;
+            head.read(&name)?
+        } else {
+            let path = crate::model::source_path(&root, &name)?;
+            if path == output {
+                continue;
+            }
+            read_text(&path)?
+        };
         let before = base.read(&name)?;
-        let after = read_text(&path)?;
         if before.is_none() && after.is_none() {
             continue;
         }
-        for text in before.iter().chain(after.iter()) {
-            if text.contains('\0') {
-                return Err(format!("Binary file is unsupported: {name}").into());
-            }
+        if after.as_deref().is_some_and(|text| text.contains('\0')) {
+            return Err(format!("Binary file is unsupported: {name}").into());
         }
         let first = annotations.len();
         if let Some(before) = before {
@@ -174,11 +209,16 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<()> {
         files += 1;
     }
     if annotations.is_empty() {
-        return Err("No changed files to prepare against the selected base".into());
+        return Err(if head.is_some() {
+            "No changed files between the selected commits"
+        } else {
+            "No changed files to prepare against the selected base"
+        }
+        .into());
     }
     let count = annotations.len();
     let id = stable_id("review", &json!(output.to_string_lossy()));
-    let proposal = json!({
+    let mut proposal = json!({
         "format":"proposal-nav", "version":2, "id":id, "revision":1,
         "title":title, "request":request, "base_commit":base.commit(),
         "implementation":{"source":"git"},
@@ -190,6 +230,11 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<()> {
         "annotations":annotations,
         "metadata":{"patchwalk_prepare":{"status":"draft","generator_version":env!("CARGO_PKG_VERSION"),"scope":"full_diff","changed_files":files,"annotation_count":count}}
     });
+    if let Some(head) = &head {
+        proposal["implementation"]["head_commit"] = json!(head.commit());
+        proposal["overview"]["questions"][1] =
+            json!("Scope is the full diff between the two pinned commits.");
+    }
     protocol::parse_proposal(&proposal)?;
     let (temporary, mut file) = Temporary::create(&output)?;
     serde_json::to_writer_pretty(&mut file, &proposal)?;
@@ -201,9 +246,15 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<()> {
     // link creates the final path atomically and fails if someone else created it.
     fs::hard_link(&temporary.0, &output)?;
     println!(
-        "Prepared draft: {}\n{files} files · {count} annotations\nBase commit: {}\nFill in TODO explanations, then validate:\n  patchwalk {} --repo {} --check",
+        "Prepared draft: {}\n{files} files · {count} annotations\nBase commit: {}",
         output.display(),
-        base.commit(),
+        base.commit()
+    );
+    if let Some(head) = &head {
+        println!("Head commit: {}", head.commit());
+    }
+    println!(
+        "Fill in TODO explanations, then validate:\n  patchwalk {} --repo {} --check",
         shell_quote(&output),
         shell_quote(&root)
     );

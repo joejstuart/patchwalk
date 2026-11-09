@@ -21,6 +21,10 @@ Do not hand off a mechanically generated draft as a completed explanation.
 
 The viewer compares each annotated path in that commit with the current working
 tree, including staged edits, unstaged edits, untracked new files, and deletions.
+When asked to review two existing commits, use prepare --base BASE --head HEAD
+or prepare --range BASE..HEAD instead. The generated proposal records the full
+after commit hash in implementation.head_commit. The viewer reads both sides
+from the pinned commits.
 Existing-code anchors refer to lines in the BASE COMMIT. Read original lines using
 git show COMMIT:path to construct accurate context. Use create_file with path only
 for files absent in the base commit. Link new files via annotation IDs.

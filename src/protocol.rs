@@ -132,6 +132,7 @@ pub enum Related {
 pub struct Implementation {
     pub files: Option<Vec<ImplementedFile>>,
     pub source: Option<String>,
+    pub head_commit: Option<String>,
 }
 #[derive(Deserialize)]
 pub struct ImplementedFile {

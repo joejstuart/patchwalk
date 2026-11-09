@@ -20,6 +20,7 @@ pub struct Proposal {
     pub architecture: String,
     pub questions: Vec<String>,
     pub base_commit: Option<String>,
+    pub head_commit: Option<String>,
     pub annotations: Vec<Annotation>,
 }
 
@@ -143,7 +144,7 @@ impl FileDiff {
     }
 }
 
-pub(crate) fn source_path(root: &Path, file: &str) -> Result<PathBuf> {
+pub(crate) fn validate_source_path(file: &str) -> Result<()> {
     if file.contains('\\')
         || file.contains(':')
         || file
@@ -155,6 +156,11 @@ pub(crate) fn source_path(root: &Path, file: &str) -> Result<PathBuf> {
     {
         return Err(format!("Expected a normalized repository-relative path: {file}").into());
     }
+    Ok(())
+}
+
+pub(crate) fn source_path(root: &Path, file: &str) -> Result<PathBuf> {
+    validate_source_path(file)?;
     let path = root.join(file);
     let mut ancestor = path.as_path();
     loop {
@@ -209,13 +215,35 @@ impl Project {
         } else {
             None
         };
-        let implementation_files = if let Some(base) = &git_base {
+        let head_commit = document
+            .implementation
+            .as_ref()
+            .and_then(|i| i.head_commit.as_deref());
+        let git_head = git_base
+            .as_ref()
+            .zip(head_commit)
+            .map(|(base, head)| base.head(head))
+            .transpose()?;
+        let implementation_files = if let Some(base) = &git_base
+            && let Some(head) = &git_head
+        {
+            let mut result = Vec::new();
+            for name in base.changed_paths(Some(head))? {
+                validate_source_path(&name)?;
+                result.push(protocol::ImplementedFile {
+                    before: base.read(&name)?,
+                    after: head.read(&name)?,
+                    path: name,
+                });
+            }
+            Some(result)
+        } else if let Some(base) = &git_base {
             let mut paths: std::collections::BTreeSet<_> = document
                 .annotations
                 .iter()
                 .map(|note| note.target.path.clone())
                 .collect();
-            paths.extend(base.changed_paths()?);
+            paths.extend(base.changed_paths(None)?);
             // Review artifacts are coordination data, not implementation changes.
             let excluded = [
                 path.clone(),
@@ -253,7 +281,7 @@ impl Project {
             document.implementation.and_then(|i| i.files)
         };
         let mut file_modes = std::collections::BTreeMap::new();
-        if git_base.is_some() {
+        if git_base.is_some() && git_head.is_none() {
             for file in implementation_files.as_ref().into_iter().flatten() {
                 let source = source_path(&root, &file.path)?;
                 if let Ok(metadata) = fs::symlink_metadata(&source) {
@@ -286,31 +314,35 @@ impl Project {
         let mut diffs = HashMap::new();
         if let Some(implementation_files) = implementation_files {
             for file in implementation_files {
-                let source = source_path(&root, &file.path)?;
-                if file.before == file.after {
-                    if git_base.is_some() && file.before.as_deref() != Some("") {
-                        continue;
+                if git_head.is_none() {
+                    let source = source_path(&root, &file.path)?;
+                    if file.before == file.after {
+                        if git_base.is_some() && file.before.as_deref() != Some("") {
+                            continue;
+                        }
+                        if git_base.is_none() {
+                            return Err(
+                                format!("Unchanged implementation file: {}", file.path).into()
+                            );
+                        }
                     }
-                    if git_base.is_none() {
-                        return Err(format!("Unchanged implementation file: {}", file.path).into());
+                    let current = match fs::read_to_string(&source) {
+                        Ok(text) => Some(text),
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::NotFound
+                                && fs::symlink_metadata(&source).is_err() =>
+                        {
+                            None
+                        }
+                        Err(e) => return Err(e.into()),
+                    };
+                    if current != file.after {
+                        return Err(format!(
+                            "Implemented source drift: {} does not match the after snapshot",
+                            file.path
+                        )
+                        .into());
                     }
-                }
-                let current = match fs::read_to_string(&source) {
-                    Ok(text) => Some(text),
-                    Err(e)
-                        if e.kind() == std::io::ErrorKind::NotFound
-                            && fs::symlink_metadata(&source).is_err() =>
-                    {
-                        None
-                    }
-                    Err(e) => return Err(e.into()),
-                };
-                if current != file.after {
-                    return Err(format!(
-                        "Implemented source drift: {} does not match the after snapshot",
-                        file.path
-                    )
-                    .into());
                 }
                 if git_base.is_none()
                     && !document
@@ -343,13 +375,32 @@ impl Project {
         let mut new_files = HashSet::new();
         // Validate against raw source before converting tabs for display.
         let mut load_location = |target: &protocol::Target, create: bool| -> Result<()> {
-            let source = source_path(&root, &target.path)?;
-            if source == path || source.canonicalize().is_ok_and(|resolved| resolved == path) {
+            let source = if git_head.is_some() {
+                validate_source_path(&target.path)?;
+                None
+            } else {
+                Some(source_path(&root, &target.path)?)
+            };
+            if source.as_ref().is_some_and(|source| {
+                source == &path || source.canonicalize().is_ok_and(|resolved| resolved == path)
+            }) {
                 return Err("A proposal cannot use itself as source".into());
             }
             if create {
-                if !diffs.contains_key(&target.path) && fs::symlink_metadata(&source).is_ok() {
-                    return Err(format!("New file already exists: {}", target.path).into());
+                if !diffs.contains_key(&target.path) {
+                    if git_head.is_some() {
+                        return Err(format!(
+                            "New file is absent from the commit diff: {}",
+                            target.path
+                        )
+                        .into());
+                    }
+                    if source
+                        .as_ref()
+                        .is_some_and(|source| fs::symlink_metadata(source).is_ok())
+                    {
+                        return Err(format!("New file already exists: {}", target.path).into());
+                    }
                 }
                 if !new_files.insert(target.path.clone()) {
                     return Err(format!("Duplicate new file: {}", target.path).into());
@@ -376,7 +427,7 @@ impl Project {
                             Some(base) => base
                                 .read(&target.path)?
                                 .ok_or("Evidence file does not exist in base commit")?,
-                            None => fs::read_to_string(source)?,
+                            None => fs::read_to_string(source.ok_or("Missing source path")?)?,
                         },
                     }
                     .lines()
@@ -530,6 +581,7 @@ impl Project {
                 architecture: document.overview.architecture,
                 questions: document.overview.questions,
                 base_commit: document.base_commit,
+                head_commit: git_head.as_ref().map(|head| head.commit().to_owned()),
                 annotations,
             },
             files: files
@@ -1252,6 +1304,44 @@ mod tests {
         );
         assert_eq!(newer.read_review().0.notes[0].comments.len(), 1);
         assert!(newer.read_review().0.stale);
+    }
+
+    #[test]
+    fn git_commit_range_reads_pinned_content_and_keeps_feedback_current() {
+        let fixture = Fixture::new();
+        let mut value = git_proposal(&fixture);
+        let before = "function submit() {}\n";
+        let after = "function submit() { committed(); }\n";
+        let source = fixture.0.join("code.ts");
+        fs::write(&source, after).unwrap();
+        git(&fixture, &["add", "--", "code.ts"]);
+        git(
+            &fixture,
+            &[
+                "-c",
+                "user.name=Proposal Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-qm",
+                "selected head",
+            ],
+        );
+        value["implementation"]["head_commit"] = git(&fixture, &["rev-parse", "HEAD"]).into();
+        write_json(&fixture, &value);
+        let project = Project::load(&fixture.path()).unwrap();
+
+        git(&fixture, &["checkout", "--detach", "HEAD^"]);
+        fs::remove_file(&source).unwrap();
+        fs::create_dir(&source).unwrap();
+        let reloaded = project.reload().unwrap();
+        let diff = &reloaded.diffs["code.ts"];
+        assert_eq!(diff.before.as_deref(), Some(before));
+        assert_eq!(diff.after.as_deref(), Some(after));
+        project.assert_current().unwrap();
+        project.save_review(&project.read_review().0).unwrap();
+        let history = crate::review::History::load(&reloaded).unwrap();
+        assert_eq!(history.rounds[0].context["files"][0]["after"], after);
     }
 
     #[test]

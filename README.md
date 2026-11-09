@@ -103,6 +103,19 @@ hash. Optional `--title TEXT` and `--request TEXT` set those fields directly.
 The full diff from that base includes staged, unstaged, deleted, and nonignored
 untracked files. It includes earlier edits; it does not identify task boundaries.
 
+To review changes already committed, supply both endpoints or use a two-dot range:
+
+```sh
+patchwalk prepare --repo /path/to/project --base HEAD~3 --head HEAD --output /tmp/range.proposal.json
+patchwalk prepare --repo /path/to/project --range 'HEAD~3..HEAD' --output /tmp/range.proposal.json
+patchwalk /tmp/range.proposal.json --repo /path/to/project
+```
+
+Either form compares the two commit trees directly. You can use hashes, branches,
+tags, or revision expressions as endpoints. Patchwalk records both full commit
+hashes and ignores the index and working tree when generating and viewing the
+proposal. Keep both commits available in the repository.
+
 The command emits a v2 Git-backed proposal with one annotation per changed
 region (nearby edits are grouped with three context lines). New files get one
 `create_file` annotation. Anchors quote exact base-side lines; IDs are deterministic
@@ -142,7 +155,7 @@ Prepare never changes the source, staging index, commits, or review history.
 
 ```text
 patchwalk [PROPOSAL] [--repo DIRECTORY] [--check]
-patchwalk prepare --output FILE [--repo DIRECTORY] [--base REVISION]
+patchwalk prepare --output FILE [--repo DIRECTORY] [--base REVISION [--head REVISION] | --range BASE..HEAD]
 patchwalk --demo
 patchwalk --agent-guide planned|implemented
 patchwalk --version
@@ -276,7 +289,7 @@ when changing its content.
 | Format | Use |
 | --- | --- |
 | Proposal v1 | Review a plan before implementation. Annotations reference current source; proposed new files are virtual previews. |
-| Proposal v2 with `implementation.source: "git"` | Review an implemented change against a pinned Git commit. |
+| Proposal v2 with `implementation.source: "git"` | Review the working tree against a pinned Git commit, or compare two pinned commits with `implementation.head_commit`. |
 | Proposal v2 with `implementation.files` | Review explicit before/after snapshots; the working tree must match the recorded after content. |
 
 For Git mode, assume the repository starts clean. Record its full commit hash as

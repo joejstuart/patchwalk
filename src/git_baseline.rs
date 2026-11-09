@@ -38,13 +38,21 @@ impl GitBaseline {
         if Self::repository_root(root)? != root {
             return Err("--repo must select the Git repository root".into());
         }
+        Self::resolve(root, commit, "Base")
+    }
+
+    pub fn head(&self, commit: &str) -> Result<Self> {
+        Self::resolve(&self.root, commit, "Head")
+    }
+
+    fn resolve(root: &Path, commit: &str, side: &str) -> Result<Self> {
         let expression = format!("{commit}^{{commit}}");
         let verified = Self::command(
             root,
             &["rev-parse", "--verify", "--end-of-options", &expression],
         )?;
         if !verified.status.success() {
-            return Err(format!("Base commit is unavailable: {commit}").into());
+            return Err(format!("{side} commit is unavailable: {commit}").into());
         }
         Ok(Self {
             root: root.to_owned(),
@@ -63,6 +71,10 @@ impl GitBaseline {
         let record = String::from_utf8(tree.stdout)?;
         let metadata = record.split('\t').next().ok_or("Invalid Git tree entry")?;
         let parts: Vec<_> = metadata.split_whitespace().collect();
+        if parts.get(1) == Some(&"tree") {
+            // A file on the other side may occupy this directory's path.
+            return Ok(None);
+        }
         if parts.len() != 3 || !matches!(parts[0], "100644" | "100755") || parts[1] != "blob" {
             return Err(format!("Git source must be a regular text file: {path}").into());
         }
@@ -70,23 +82,30 @@ impl GitBaseline {
         if !contents.status.success() {
             return Err(format!("Cannot read Git source: {path}").into());
         }
-        Ok(Some(String::from_utf8(contents.stdout)?))
+        let text = String::from_utf8(contents.stdout)?;
+        if text.contains('\0') {
+            return Err(format!("Binary file is unsupported: {path}").into());
+        }
+        Ok(Some(text))
     }
 
-    pub fn changed_paths(&self) -> Result<std::collections::BTreeSet<String>> {
+    pub fn changed_paths(&self, head: Option<&Self>) -> Result<std::collections::BTreeSet<String>> {
         let mut paths = std::collections::BTreeSet::new();
-        for args in [
-            vec![
-                "diff",
-                "--no-ext-diff",
-                "--no-renames",
-                "--name-only",
-                "-z",
-                &self.commit,
-                "--",
-            ],
-            vec!["ls-files", "--others", "--exclude-standard", "-z"],
-        ] {
+        let mut diff = vec![
+            "diff",
+            "--no-ext-diff",
+            "--no-renames",
+            "--name-only",
+            "-z",
+            self.commit(),
+        ];
+        diff.extend(head.map(Self::commit));
+        diff.push("--");
+        let mut commands = vec![diff];
+        if head.is_none() {
+            commands.push(vec!["ls-files", "--others", "--exclude-standard", "-z"]);
+        }
+        for args in commands {
             let output = Self::command(&self.root, &args)?;
             if !output.status.success() {
                 return Err("Cannot list changed Git paths".into());

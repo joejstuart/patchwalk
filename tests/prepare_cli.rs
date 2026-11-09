@@ -188,6 +188,116 @@ fn prepare_uses_explicit_base_discovers_root_and_keeps_ids_deterministic() {
 }
 
 #[test]
+fn prepare_accepts_commit_endpoints_and_ranges_with_the_same_pinned_diff() {
+    let f = Fixture::new();
+    f.write("changed.txt", "base\n");
+    f.write("removed.txt", "remove this\n");
+    f.commit();
+    let base = f.git(&["rev-parse", "HEAD"]).trim().to_owned();
+    f.write("transient.txt", "intermediate only\n");
+    f.commit();
+    fs::remove_file(f.0.join("transient.txt")).unwrap();
+    fs::remove_file(f.0.join("removed.txt")).unwrap();
+    f.write("changed.txt", "committed change\n");
+    f.write("added.txt", "committed addition\n");
+    f.commit();
+    let head = f.git(&["rev-parse", "HEAD"]).trim().to_owned();
+    f.git(&["tag", "review-head"]);
+
+    f.write("changed.txt", "staged change\n");
+    f.git(&["add", "changed.txt"]);
+    f.write("changed.txt", "working change\n");
+    f.write("untracked.bin", "a\0b");
+    let index = fs::read(f.0.join(".git/index")).unwrap();
+    let output = f.0.join("range.proposal.json");
+    success(f.prepare(&[
+        "--base",
+        "HEAD~2",
+        "--head",
+        "review-head",
+        "--output",
+        "range.proposal.json",
+    ]));
+    let proposal = f.valid(&output);
+    assert_eq!(proposal["base_commit"], base);
+    assert_eq!(proposal["implementation"]["head_commit"], head);
+    let notes = proposal["annotations"].as_array().unwrap();
+    let changes: Vec<_> = notes
+        .iter()
+        .map(|note| {
+            (
+                note["target"]["path"].as_str().unwrap(),
+                note["operation"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        changes,
+        [
+            ("added.txt", "create_file"),
+            ("changed.txt", "replace"),
+            ("removed.txt", "delete")
+        ]
+    );
+    assert_eq!(notes[1]["target"]["context"], "base");
+    assert_eq!(fs::read(f.0.join(".git/index")).unwrap(), index);
+    assert_eq!(
+        fs::read_to_string(f.0.join("changed.txt")).unwrap(),
+        "working change\n"
+    );
+
+    fs::remove_file(&output).unwrap();
+    success(f.prepare(&[
+        "--range",
+        "HEAD~2..review-head",
+        "--output",
+        "range.proposal.json",
+    ]));
+    assert_eq!(proposal, f.valid(&output));
+    f.commit();
+    f.git(&["tag", "-f", "review-head"]);
+    assert_eq!(proposal, f.valid(&output));
+}
+
+#[test]
+fn prepare_rejects_invalid_or_empty_commit_ranges_without_publishing() {
+    let f = Fixture::new();
+    f.write("file.txt", "base\n");
+    f.commit();
+    for (args, error) in [
+        (vec!["--range", "HEAD...HEAD"], "BASE..HEAD"),
+        (vec!["--range", "HEAD.."], "BASE..HEAD"),
+        (vec!["--range", "..HEAD"], "BASE..HEAD"),
+        (
+            vec!["--range", "HEAD..HEAD", "--base", "HEAD"],
+            "cannot be combined",
+        ),
+        (
+            vec!["--range", "HEAD..HEAD", "--head", "HEAD"],
+            "cannot be combined",
+        ),
+        (vec!["--head", "HEAD"], "requires --base"),
+        (
+            vec!["--range", "missing..HEAD"],
+            "Base commit is unavailable",
+        ),
+        (
+            vec!["--range", "HEAD..missing"],
+            "Head commit is unavailable",
+        ),
+        (vec!["--range", "HEAD..HEAD"], "No changed files"),
+    ] {
+        let mut command = vec!["--output", "out.json"];
+        command.extend(args);
+        let result = f.prepare(&command);
+        assert!(!result.status.success());
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(stderr.contains(error), "{stderr}");
+        assert!(!f.0.join("out.json").exists());
+    }
+}
+
+#[test]
 fn prepare_refuses_overwrites_clean_repos_and_unsupported_files_without_artifacts() {
     let f = Fixture::new();
     f.write("file.txt", "old\n");

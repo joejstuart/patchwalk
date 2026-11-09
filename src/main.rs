@@ -52,7 +52,7 @@ fn start() -> Result<()> {
         match arg.as_str() {
             "--help" | "-h" => {
                 println!(
-                    "Patchwalk — review agent-generated changes in your terminal\n\nUsage: patchwalk [proposal.json] [--repo DIRECTORY] [--check]\n       patchwalk prepare --output FILE [--repo DIRECTORY] [--base REVISION]\n       patchwalk --demo\n       patchwalk --agent-guide planned|implemented\n       patchwalk --version\n\nWithout a path, opens a disposable bundled demo (demo feedback is not retained).\n--repo selects the source root; defaults to the proposal's directory.\n--check validates the v1/v2 schema, IDs, paths, ranges, and source context without opening the UI.\n--agent-guide prints generation instructions and the JSON schema for an agent.\nprepare generates a validated draft with automatic diff anchors; see prepare --help.\n\nTry it: patchwalk --demo\nReview: patchwalk change.proposal.json --repo /path/to/project\nValidate: patchwalk change.proposal.json --repo /path/to/project --check\n\nIn the UI: Enter opens a change, w explains it, c comments, R reloads, ? helps.\nq saves feedback beside the proposal and quits. Ctrl+C quits without saving."
+                    "Patchwalk — review agent-generated changes in your terminal\n\nUsage: patchwalk [proposal.json] [--repo DIRECTORY] [--check]\n       patchwalk prepare --output FILE [--repo DIRECTORY]\n                        [--base REVISION [--head REVISION] | --range BASE..HEAD]\n       patchwalk --demo\n       patchwalk --agent-guide planned|implemented\n       patchwalk --version\n\nWithout a path, opens a disposable bundled demo (demo feedback is not retained).\n--repo selects the source root; defaults to the proposal's directory.\n--check validates the v1/v2 schema, IDs, paths, ranges, and source context without opening the UI.\n--agent-guide prints generation instructions and the JSON schema for an agent.\nprepare generates a validated draft with automatic diff anchors; see prepare --help.\n\nTry it: patchwalk --demo\nReview: patchwalk change.proposal.json --repo /path/to/project\nValidate: patchwalk change.proposal.json --repo /path/to/project --check\n\nIn the UI: Enter opens a change, w explains it, c comments, R reloads, ? helps.\nq saves feedback beside the proposal and quits. Ctrl+C quits without saving."
                 );
                 return Ok(());
             }
@@ -102,7 +102,7 @@ fn start() -> Result<()> {
     };
     if check {
         println!(
-            "Valid proposal v{}: {}\nID: {} · revision {}\n{} annotations across {} loaded files\nBase commit: {}\nFeedback: {}",
+            "Valid proposal v{}: {}\nID: {} · revision {}\n{} annotations across {} loaded files\nBase commit: {}",
             project.proposal.version,
             project.proposal.title,
             project.proposal.id,
@@ -113,9 +113,12 @@ fn start() -> Result<()> {
                 .proposal
                 .base_commit
                 .as_deref()
-                .unwrap_or("not recorded"),
-            project.state_path.display()
+                .unwrap_or("not recorded")
         );
+        if let Some(head) = &project.proposal.head_commit {
+            println!("Head commit: {head}");
+        }
+        println!("Feedback: {}", project.state_path.display());
         return Ok(());
     }
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {

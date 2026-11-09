@@ -33,6 +33,10 @@ For a revision, edit the existing proposal, preserve IDs, and increment revision
 do not rerun prepare over saved work. Planned proposals still use the planned
 guide directly.
 
+For a review between existing commits, use `--base BASE --head HEAD` or
+`--range BASE..HEAD` with `prepare`. Both endpoints are pinned and the review
+reads both sides from Git.
+
 Replace TODO request, summary, architecture, intent and rationale with grounded
 explanations. Rename annotation titles for a useful walkthrough, record actual
 validation results, and add meaningful alternatives and related links where
